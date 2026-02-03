@@ -27,6 +27,10 @@ Intercom supports multiple usage patterns:
 - **Contract-enabled:** Deterministic state + contract chat + data persistence.
 - **Value transfer (optional):** Uses the settlement layer for paid transactions and contract transactions (use chat and feature systems in contracts to bypass costs, use transactions when you need validation).
 
+## Indexer Guidance
+- **Critical apps (finance/settlement):** prefer **multiple indexers** for redundancy and availability.
+- **Most app dev / single-peer setups:** **one indexer is enough**, typically the admin peer itself.
+
 ## Contracts
 - Contracts always come in **pairs**: `contract.js` (state/handlers) and `protocol.js` (command mapping + tx entrypoints).
 - Before building your own app, **study the structure and comments** in the existing `contract/contract.js` + `contract/protocol.js`.
