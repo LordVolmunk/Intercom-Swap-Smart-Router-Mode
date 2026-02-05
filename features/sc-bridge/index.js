@@ -78,6 +78,7 @@ class ScBridge extends Feature {
     this.filterChannels = Array.isArray(config.filterChannels)
       ? new Set(config.filterChannels.map((c) => String(c)))
       : null;
+    this.info = config.info && typeof config.info === 'object' ? config.info : null;
   }
 
   attachSidechannel(sidechannel) {
@@ -340,6 +341,14 @@ class ScBridge extends Feature {
         const channels = Array.from(this.sidechannel.channels.keys());
         const connectionCount = this.sidechannel.connections.size;
         this._broadcastToClient(client, { type: 'stats', channels, connectionCount });
+        return;
+      }
+      case 'info': {
+        if (!this.info) {
+          this._sendError(client, 'Info not available.');
+          return;
+        }
+        this._broadcastToClient(client, { type: 'info', info: this.info });
         return;
       }
       default:

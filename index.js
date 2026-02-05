@@ -366,15 +366,19 @@ if (!subnetBootstrap) {
 
 console.log('');
 console.log('====================INTERCOM ====================');
+const msbChannel = b4a.toString(msbConfig.channel, 'utf8');
+const msbStorePath = path.join(msbStoresDirectory, msbStoreName);
+const peerStorePath = path.join(peerStoresDirectory, peerStoreNameRaw);
+const peerWriterKey = peer.writerLocalKey ?? peer.base?.local?.key?.toString('hex') ?? null;
 console.log('MSB network bootstrap:', msbBootstrapHex);
-console.log('MSB channel:', b4a.toString(msbConfig.channel, 'utf8'));
-console.log('MSB store:', path.join(msbStoresDirectory, msbStoreName));
-console.log('Peer store:', path.join(peerStoresDirectory, peerStoreNameRaw));
+console.log('MSB channel:', msbChannel);
+console.log('MSB store:', msbStorePath);
+console.log('Peer store:', peerStorePath);
 console.log('Peer subnet bootstrap:', effectiveSubnetBootstrapHex);
 console.log('Peer subnet channel:', subnetChannel);
 console.log('Peer pubkey (hex):', peer.wallet.publicKey);
 console.log('Peer trac address (bech32m):', peer.wallet.address ?? null);
-console.log('Peer writer key (hex):', peer.writerLocalKey ?? peer.base?.local?.key?.toString('hex') ?? null);
+console.log('Peer writer key (hex):', peerWriterKey);
 console.log('Sidechannel entry:', sidechannelEntry);
 if (sidechannelExtras.length > 0) {
   console.log('Sidechannel extras:', sidechannelExtras.join(', '));
@@ -404,6 +408,19 @@ if (scBridgeEnabled) {
     debug: scBridgeDebug,
     cliEnabled: scBridgeCliEnabled,
     requireAuth: true,
+    info: {
+      msbBootstrap: msbBootstrapHex,
+      msbChannel,
+      msbStore: msbStorePath,
+      peerStore: peerStorePath,
+      subnetBootstrap: effectiveSubnetBootstrapHex,
+      subnetChannel,
+      peerPubkey: peer.wallet.publicKey,
+      peerTracAddress: peer.wallet.address ?? null,
+      peerWriterKey,
+      sidechannelEntry,
+      sidechannelExtras: sidechannelExtras.slice(),
+    },
   });
 }
 
