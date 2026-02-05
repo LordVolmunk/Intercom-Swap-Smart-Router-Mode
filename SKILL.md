@@ -205,6 +205,7 @@ Sidechannels:
 - `--sidechannel-inviter-keys "<pubkey1,pubkey2>"` : trusted inviter **peer pubkeys** (hex). Needed so joiners accept admin messages.
 - `--sidechannel-invite-ttl <sec>` : default TTL for invites created via `/sc_invite` (default: 604800 = 7 days).
   - **Invite identity:** invites are signed/verified against the **peer P2P pubkey (hex)**. The invite payload may also include the inviter’s **trac address** for payment/settlement, but validation uses the peer key.
+- **Invite-only join:** peers must hold a valid invite (or be an approved inviter) before they can join protected channels; uninvited joins are rejected.
 - `--sidechannel-welcome-required 0|1` : require a **signed welcome** for all sidechannels (**default: on**).
 - `--sidechannel-owner "<chan:pubkey,chan2:pubkey>"` : channel **owner** peer pubkey (hex). This key signs the welcome and is the source of truth.
 - `--sidechannel-welcome "<chan:welcome_b64,chan2:welcome_b64>"` : **pre‑signed welcome** per channel (from `/sc_welcome`). Recommended for `0000intercom`.
@@ -349,6 +350,17 @@ If you need a private/extra channel:
   - WS client: `{ "type": "open", "channel": "my-channel" }` (broadcasts a request)
   - WS client: `{ "type": "join", "channel": "my-channel" }` (join locally)
   - Remote peers must **also** join (auto‑join if enabled).
+
+**Invite‑only channels (WS JSON)**:
+- `invite` and `welcome` are supported on `open`, `join`, and `send`.
+- They can be **JSON objects** or **base64** strings (from `/sc_invite` / `/sc_welcome`).
+- Examples:
+  - Open with invite + welcome:  
+    `{ "type":"open", "channel":"priv1", "invite":"<invite_b64>", "welcome":"<welcome_b64>" }`
+  - Join locally with invite:  
+    `{ "type":"join", "channel":"priv1", "invite":"<invite_b64>" }`
+  - Send with invite:  
+    `{ "type":"send", "channel":"priv1", "message":"...", "invite":"<invite_b64>" }`
 
 If a token is set, authenticate first:
 ```json

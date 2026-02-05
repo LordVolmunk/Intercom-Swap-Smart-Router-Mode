@@ -530,6 +530,14 @@ class Sidechannel extends Feature {
     const channel = String(name || '').trim();
     if (!channel) return null;
     if (this.channels.has(channel)) return this.channels.get(channel);
+    if (this._inviteRequired(channel)) {
+      const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
+      const selfIsInviter = this.inviterKeys && selfKey && this.inviterKeys.has(selfKey);
+      if (!selfIsInviter && !this._isLocallyInvited(channel)) {
+        console.log(`[sidechannel:${channel}] join denied (invite required).`);
+        return null;
+      }
+    }
     const entry = {
       name: channel,
       topic: toTopic(channel),
@@ -749,6 +757,21 @@ class Sidechannel extends Feature {
       for (const connection of this.connections.keys()) {
         this._openChannelForConnection(connection, entry);
       }
+    }
+    return true;
+  }
+
+  acceptInvite(name, invite = null, welcome = null) {
+    const channel = String(name || '').trim();
+    if (!channel) return false;
+    if (invite) {
+      this._acceptLocalInvite(invite, channel);
+      if (invite?.welcome) {
+        this._verifyWelcome(invite.welcome, channel, null);
+      }
+    }
+    if (welcome) {
+      this._verifyWelcome(welcome, channel, null);
     }
     return true;
   }

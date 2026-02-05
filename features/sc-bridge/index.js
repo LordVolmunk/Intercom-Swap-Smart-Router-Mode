@@ -13,6 +13,27 @@ const normalizeText = (value) => {
   }
 };
 
+const parseJsonOrBase64 = (value) => {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('{')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch (_e) {
+      return null;
+    }
+  }
+  try {
+    const text = b4a.toString(b4a.from(trimmed, 'base64'), 'utf8');
+    return JSON.parse(text);
+  } catch (_e) {
+    return null;
+  }
+};
+
 const parseFilter = (raw) => {
   if (!raw) return [];
   return String(raw)
@@ -218,7 +239,25 @@ class ScBridge extends Feature {
           return;
         }
         const payload = message.message;
-        this.sidechannel.broadcast(channel, payload);
+        const invite = parseJsonOrBase64(message.invite);
+        const welcome = parseJsonOrBase64(message.welcome);
+        if (message.invite && !invite) {
+          this._sendError(client, 'Invalid invite (expected JSON or base64).');
+          return;
+        }
+        if (message.welcome && !welcome) {
+          this._sendError(client, 'Invalid welcome (expected JSON or base64).');
+          return;
+        }
+        let invitePayload = invite;
+        if (invitePayload && welcome && !invitePayload.welcome) {
+          invitePayload = { ...invitePayload, welcome };
+        }
+        if (!invitePayload && welcome) {
+          this._sendError(client, 'Welcome requires invite for send; use open or include invite.');
+          return;
+        }
+        this.sidechannel.broadcast(channel, payload, invitePayload ? { invite: invitePayload } : undefined);
         this._broadcastToClient(client, { type: 'sent', channel });
         return;
       }
@@ -232,8 +271,29 @@ class ScBridge extends Feature {
           this._sendError(client, 'Missing channel.');
           return;
         }
-        this.sidechannel.addChannel(channel).catch(() => {});
-        this._broadcastToClient(client, { type: 'joined', channel });
+        const invite = parseJsonOrBase64(message.invite);
+        const welcome = parseJsonOrBase64(message.welcome);
+        if (message.invite && !invite) {
+          this._sendError(client, 'Invalid invite (expected JSON or base64).');
+          return;
+        }
+        if (message.welcome && !welcome) {
+          this._sendError(client, 'Invalid welcome (expected JSON or base64).');
+          return;
+        }
+        if (invite || welcome) {
+          this.sidechannel.acceptInvite(channel, invite, welcome);
+        }
+        this.sidechannel
+          .addChannel(channel)
+          .then((ok) => {
+            if (!ok) {
+              this._sendError(client, 'Join denied (invite required or invalid).');
+              return;
+            }
+            this._broadcastToClient(client, { type: 'joined', channel });
+          })
+          .catch(() => {});
         return;
       }
       case 'open': {
@@ -247,7 +307,17 @@ class ScBridge extends Feature {
           return;
         }
         const via = message.via ? String(message.via) : null;
-        this.sidechannel.requestOpen(channel, via);
+        const invite = parseJsonOrBase64(message.invite);
+        const welcome = parseJsonOrBase64(message.welcome);
+        if (message.invite && !invite) {
+          this._sendError(client, 'Invalid invite (expected JSON or base64).');
+          return;
+        }
+        if (message.welcome && !welcome) {
+          this._sendError(client, 'Invalid welcome (expected JSON or base64).');
+          return;
+        }
+        this.sidechannel.requestOpen(channel, via, invite, welcome);
         this._broadcastToClient(client, { type: 'open_requested', channel, via: via || null });
         return;
       }
