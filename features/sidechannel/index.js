@@ -951,6 +951,16 @@ class Sidechannel extends Feature {
       throw new Error('Sidechannel requires peer.swarm to be initialized.');
     }
 
+    // Hyperswarm can accept `join()` calls before the DHT is fully bootstrapped.
+    // In practice this can lead to missed announces/lookups and permanent
+    // non-discovery until restart. Wait for the DHT readiness barrier when
+    // available, then proceed with the normal join+flush path.
+    const dht = this.peer.swarm.dht;
+    if (dht && typeof dht.fullyBootstrapped === 'function') {
+      if (this.debug) console.log('[sidechannel] waiting for DHT bootstrap...');
+      await dht.fullyBootstrapped();
+    }
+
     this.peer.swarm.on('connection', (connection) => {
       if (this._isBlocked(connection)) return;
       for (const entry of this.channels.values()) {
