@@ -210,5 +210,170 @@ export const INTERCOMSWAP_TOOLS = [
     },
     required: ['channel', 'trade_id', 'terms_hash_hex'],
   }),
-];
 
+  // Lightning (LN) operator actions (executor must use configured backend/credentials).
+  tool('intercomswap_ln_info', 'Get Lightning node info (impl/backend configured locally).', emptyParams),
+  tool('intercomswap_ln_newaddr', 'Get a new on-chain BTC address from the LN node wallet.', emptyParams),
+  tool('intercomswap_ln_listfunds', 'Get on-chain + channel balances.', emptyParams),
+  tool('intercomswap_ln_connect', 'Connect to a Lightning peer (nodeid@host:port).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      peer: { type: 'string', minLength: 10, maxLength: 200, description: 'nodeid@host:port' },
+    },
+    required: ['peer'],
+  }),
+  tool('intercomswap_ln_fundchannel', 'Open a Lightning channel to a peer.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      node_id: { type: 'string', minLength: 66, maxLength: 66, pattern: '^[0-9a-fA-F]{66}$' },
+      amount_sats: { type: 'integer', minimum: 1_000, maximum: 10_000_000_000 },
+      private: { type: 'boolean', description: 'Prefer private channels for swaps.' },
+    },
+    required: ['node_id', 'amount_sats'],
+  }),
+  tool('intercomswap_ln_invoice_create', 'Create a standard BOLT11 invoice (no hodl invoices).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      amount_msat: { type: 'integer', minimum: 1, maximum: 21_000_000 * 100_000_000 * 1000 },
+      label: { type: 'string', minLength: 1, maxLength: 120 },
+      description: { type: 'string', minLength: 1, maxLength: 500 },
+      expiry_sec: { type: 'integer', minimum: 60, maximum: 60 * 60 * 24 * 7 },
+    },
+    required: ['amount_msat', 'label', 'description'],
+  }),
+  tool('intercomswap_ln_decodepay', 'Decode a BOLT11 invoice offline.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      bolt11: { type: 'string', minLength: 20, maxLength: 8000 },
+    },
+    required: ['bolt11'],
+  }),
+  tool('intercomswap_ln_pay', 'Pay a BOLT11 invoice.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      bolt11: { type: 'string', minLength: 20, maxLength: 8000 },
+    },
+    required: ['bolt11'],
+  }),
+  tool('intercomswap_ln_pay_status', 'Query payment status by payment_hash.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      payment_hash_hex: hex32Param,
+    },
+    required: ['payment_hash_hex'],
+  }),
+  tool('intercomswap_ln_preimage_get', 'Get a payment preimage by payment_hash (for recovery).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      payment_hash_hex: hex32Param,
+    },
+    required: ['payment_hash_hex'],
+  }),
+
+  // Solana escrow / program ops (executor must use configured RPC + keypairs).
+  tool('intercomswap_sol_balance', 'Get SOL balance for a pubkey.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: { pubkey: base58Param },
+    required: ['pubkey'],
+  }),
+  tool('intercomswap_sol_token_balance', 'Get SPL token balance for a (owner,mint) pair (ATA).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      owner: base58Param,
+      mint: base58Param,
+    },
+    required: ['owner', 'mint'],
+  }),
+  tool('intercomswap_sol_escrow_get', 'Fetch escrow state by payment_hash (and mint).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      payment_hash_hex: hex32Param,
+      mint: base58Param,
+    },
+    required: ['payment_hash_hex', 'mint'],
+  }),
+  tool('intercomswap_sol_escrow_init', 'Initialize an escrow locked to LN payment_hash.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      payment_hash_hex: hex32Param,
+      mint: base58Param,
+      amount: atomicAmountParam,
+      recipient: base58Param,
+      refund: base58Param,
+      refund_after_unix: unixSecParam,
+      platform_fee_bps: { type: 'integer', minimum: 0, maximum: 500 },
+      trade_fee_bps: { type: 'integer', minimum: 0, maximum: 1000 },
+      trade_fee_collector: base58Param,
+      platform_fee_collector: { ...base58Param, description: 'Optional override, else use program config.' },
+    },
+    required: [
+      'payment_hash_hex',
+      'mint',
+      'amount',
+      'recipient',
+      'refund',
+      'refund_after_unix',
+      'platform_fee_bps',
+      'trade_fee_bps',
+      'trade_fee_collector',
+    ],
+  }),
+  tool('intercomswap_sol_escrow_claim', 'Claim escrow by submitting LN preimage (recipient signature required).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      preimage_hex: { type: 'string', minLength: 64, maxLength: 64, pattern: '^[0-9a-fA-F]{64}$' },
+      mint: base58Param,
+    },
+    required: ['preimage_hex', 'mint'],
+  }),
+  tool('intercomswap_sol_escrow_refund', 'Refund escrow after timeout (refund signature required).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      payment_hash_hex: hex32Param,
+      mint: base58Param,
+    },
+    required: ['payment_hash_hex', 'mint'],
+  }),
+  tool('intercomswap_sol_config_get', 'Get program fee config (platform config PDA).', emptyParams),
+  tool('intercomswap_sol_config_set', 'Set program fee config (admin authority required).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      fee_bps: { type: 'integer', minimum: 0, maximum: 500 },
+      fee_collector: base58Param,
+    },
+    required: ['fee_bps', 'fee_collector'],
+  }),
+  tool('intercomswap_sol_fees_withdraw', 'Withdraw accrued platform fees from fee vault (admin authority required).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      mint: base58Param,
+      to: base58Param,
+      amount: atomicAmountParam,
+    },
+    required: ['mint', 'to', 'amount'],
+  }),
+
+  // Receipts / recovery (local-only, deterministic).
+  tool('intercomswap_receipts_list', 'List local trade receipts (sqlite).', emptyParams),
+  tool('intercomswap_receipts_show', 'Show a local receipt by trade_id.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: { trade_id: { type: 'string', minLength: 1, maxLength: 128 } },
+    required: ['trade_id'],
+  }),
+];
