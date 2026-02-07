@@ -2,8 +2,6 @@
 import process from 'node:process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import { PublicKey } from '@solana/web3.js';
@@ -24,12 +22,12 @@ import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
 import { verifySwapPrePayOnchain } from '../src/swap/verify.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
+import { normalizeLndNetwork } from '../src/ln/lnd.js';
+import { lnPay } from '../src/ln/client.js';
 import { claimEscrowTx } from '../src/solana/lnUsdtEscrowClient.js';
 import { readSolanaKeypair } from '../src/solana/keypair.js';
 import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
-
-const execFileP = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,28 +148,6 @@ async function sendAndConfirm(connection, tx) {
   return sig;
 }
 
-async function lnCli({
-  backend,
-  composeFile,
-  service,
-  network,
-  cliBin,
-  args,
-}) {
-  const useDocker = backend === 'docker';
-  const cmd = useDocker ? 'docker' : (cliBin || 'lightning-cli');
-  const fullArgs = useDocker
-    ? ['compose', '-f', composeFile, 'exec', '-T', service, 'lightning-cli', `--network=${network}`, ...args]
-    : [`--network=${network}`, ...args];
-  const { stdout } = await execFileP(cmd, fullArgs, { cwd: repoRoot, maxBuffer: 1024 * 1024 * 50 });
-  const text = String(stdout || '').trim();
-  try {
-    return JSON.parse(text);
-  } catch (_e) {
-    return { result: text };
-  }
-}
-
 async function main() {
   const { flags } = parseArgs(process.argv.slice(2));
 
@@ -209,17 +185,23 @@ async function main() {
   const solMintStr = flags.get('solana-mint') ? String(flags.get('solana-mint')).trim() : '';
   const solDecimals = parseIntFlag(flags.get('solana-decimals'), 'solana-decimals', 6);
 
+  const lnImpl = (flags.get('ln-impl') && String(flags.get('ln-impl')).trim().toLowerCase()) || 'cln';
+  if (lnImpl !== 'cln' && lnImpl !== 'lnd') die('Invalid --ln-impl (expected cln|lnd)');
   const lnBackend = (flags.get('ln-backend') && String(flags.get('ln-backend')).trim()) || 'docker';
   const lnComposeFile = (flags.get('ln-compose-file') && String(flags.get('ln-compose-file')).trim()) || defaultComposeFile;
   const lnService = flags.get('ln-service') ? String(flags.get('ln-service')).trim() : '';
   const lnNetworkRaw = (flags.get('ln-network') && String(flags.get('ln-network')).trim()) || 'regtest';
   let lnNetwork;
   try {
-    lnNetwork = normalizeClnNetwork(lnNetworkRaw);
+    lnNetwork = lnImpl === 'lnd' ? normalizeLndNetwork(lnNetworkRaw) : normalizeClnNetwork(lnNetworkRaw);
   } catch (err) {
     die(err?.message ?? String(err));
   }
   const lnCliBin = flags.get('ln-cli-bin') ? String(flags.get('ln-cli-bin')).trim() : '';
+  const lndRpcserver = flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '';
+  const lndTlsCert = flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '';
+  const lndMacaroon = flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '';
+  const lndDir = flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '';
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;
 
@@ -227,6 +209,22 @@ async function main() {
     if (!solKeypairPath) die('Missing --solana-keypair (required when --run-swap 1)');
     if (!lnService && lnBackend === 'docker') die('Missing --ln-service (required when --ln-backend docker)');
   }
+
+  const ln = {
+    impl: lnImpl,
+    backend: lnBackend,
+    composeFile: lnComposeFile,
+    service: lnService,
+    network: lnNetwork,
+    cliBin: lnCliBin,
+    cwd: repoRoot,
+    lnd: {
+      rpcserver: lndRpcserver,
+      tlscertpath: lndTlsCert,
+      macaroonpath: lndMacaroon,
+      lnddir: lndDir,
+    },
+  };
 
   const sc = new ScBridgeClient({ url, token });
   await sc.connect();
@@ -582,14 +580,7 @@ async function main() {
     }
 
     // Pay LN invoice and obtain preimage.
-    const payRes = await lnCli({
-      backend: lnBackend,
-      composeFile: lnComposeFile,
-      service: lnService,
-      network: lnNetwork,
-      cliBin: lnCliBin,
-      args: ['pay', swapCtx.trade.invoice.bolt11],
-    });
+    const payRes = await lnPay(ln, { bolt11: swapCtx.trade.invoice.bolt11 });
     const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(preimageHex)) throw new Error('LN pay missing payment_preimage');
 

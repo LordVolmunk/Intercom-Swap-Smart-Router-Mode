@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 import process from 'node:process';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import { normalizeClnNetwork } from '../src/ln/cln.js';
-
-const execFileP = promisify(execFile);
+import { normalizeLndNetwork } from '../src/ln/lnd.js';
+import { lnConnect, lnDecodePay, lnFundChannel, lnGetInfo, lnInvoice, lnListFunds, lnNewAddress, lnPay, lnPayStatus, lnPreimageGet } from '../src/ln/client.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,18 +19,25 @@ function die(msg) {
 
 function usage() {
   return `
-lnctl (Lightning operator tool; Core Lightning / CLN only)
+lnctl (Lightning operator tool; CLN or LND)
 
 Global flags:
+  --impl <cln|lnd>                   (default: cln)
   --backend <cli|docker>             (default: cli)
-  --network <bitcoin|testnet|regtest|signet> (default: regtest) (aliases: mainnet->bitcoin)
+  --network <bitcoin|mainnet|testnet|regtest|signet> (default: regtest)
 
 Docker backend flags:
   --compose-file <path>             (default: dev/ln-regtest/docker-compose.yml)
   --service <name>                  (required for docker backend)
 
 CLI backend flags:
-  --cli-bin <path>                  (default: lightning-cli)
+  --cli-bin <path>                  (default: lightning-cli for cln, lncli for lnd)
+
+LND (cli backend) extra flags:
+  --lnd-rpcserver <host:port>
+  --lnd-tlscert <path>
+  --lnd-macaroon <path>
+  --lnd-dir <path>
 
 Commands:
   info
@@ -88,32 +93,6 @@ function normalizeHex32(value, label) {
   return hex;
 }
 
-async function lnCli({ backend, composeFile, service, network, cliBin, args }) {
-  const useDocker = backend === 'docker';
-  const cmd = useDocker ? 'docker' : (cliBin || 'lightning-cli');
-  const fullArgs = useDocker
-    ? ['compose', '-f', composeFile, 'exec', '-T', service, 'lightning-cli', `--network=${network}`, ...args]
-    : [`--network=${network}`, ...args];
-
-  try {
-    const { stdout } = await execFileP(cmd, fullArgs, { cwd: repoRoot, maxBuffer: 1024 * 1024 * 50 });
-    const text = String(stdout || '').trim();
-    try {
-      return JSON.parse(text);
-    } catch (_e) {
-      return { result: text };
-    }
-  } catch (err) {
-    const code = err?.code;
-    const stderr = String(err?.stderr || '').trim();
-    const stdout = String(err?.stdout || '').trim();
-    const msg = stderr || stdout || err?.message || String(err);
-    const e = new Error(msg);
-    e.code = code;
-    throw e;
-  }
-}
-
 function sumMsatFromFunds(listfunds) {
   const outs = Array.isArray(listfunds?.outputs) ? listfunds.outputs : [];
   const chans = Array.isArray(listfunds?.channels) ? listfunds.channels : [];
@@ -147,31 +126,6 @@ function sumMsatFromFunds(listfunds) {
   return { onchainConfirmed, onchainUnconfirmed, channelTotal };
 }
 
-async function listPaysMaybe({ backend, composeFile, service, network, cliBin, paymentHashHex }) {
-  // CLN versions differ; try listpays first, then listsendpays.
-  try {
-    return await lnCli({ backend, composeFile, service, network, cliBin, args: ['listpays', paymentHashHex] });
-  } catch (_e) {}
-  try {
-    return await lnCli({ backend, composeFile, service, network, cliBin, args: ['listsendpays', paymentHashHex] });
-  } catch (err) {
-    throw err;
-  }
-}
-
-function extractPreimageHex(paysRes) {
-  const pays = Array.isArray(paysRes?.pays) ? paysRes.pays : Array.isArray(paysRes?.payments) ? paysRes.payments : [];
-  for (const p of pays) {
-    const cand =
-      p?.preimage ||
-      p?.payment_preimage ||
-      p?.payment_preimage_hex ||
-      p?.preimage_hex;
-    if (typeof cand === 'string' && /^[0-9a-f]{64}$/i.test(cand.trim())) return cand.trim().toLowerCase();
-  }
-  return null;
-}
-
 async function main() {
   const { args, flags } = parseArgs(process.argv.slice(2));
   const cmd = args[0] || '';
@@ -180,12 +134,15 @@ async function main() {
     return;
   }
 
+  const impl = (flags.get('impl') && String(flags.get('impl')).trim().toLowerCase()) || 'cln';
+  if (impl !== 'cln' && impl !== 'lnd') die('Invalid --impl (expected cln|lnd)');
+
   const backend = (flags.get('backend') && String(flags.get('backend')).trim()) || 'cli';
   if (backend !== 'cli' && backend !== 'docker') die('Invalid --backend (expected cli|docker)');
   const networkRaw = (flags.get('network') && String(flags.get('network')).trim()) || 'regtest';
   let network;
   try {
-    network = normalizeClnNetwork(networkRaw);
+    network = impl === 'lnd' ? normalizeLndNetwork(networkRaw) : normalizeClnNetwork(networkRaw);
   } catch (err) {
     die(err?.message ?? String(err));
   }
@@ -197,25 +154,96 @@ async function main() {
   if (backend === 'docker' && !service) die('Missing --service (required for --backend docker)');
 
   if (cmd === 'info') {
-    const info = await lnCli({ backend, composeFile, service, network, cliBin, args: ['getinfo'] });
+    const info = await lnGetInfo({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    });
     process.stdout.write(`${JSON.stringify({ type: 'info', info }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'newaddr') {
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: ['newaddr'] });
-    process.stdout.write(`${JSON.stringify({ type: 'newaddr', ...r }, null, 2)}\n`);
+    const r = await lnNewAddress({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    });
+    process.stdout.write(`${JSON.stringify({ type: 'newaddr', address: r.address, raw: r.raw }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'listfunds') {
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: ['listfunds'] });
-    process.stdout.write(`${JSON.stringify({ type: 'listfunds', ...r }, null, 2)}\n`);
+    const r = await lnListFunds({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    });
+    process.stdout.write(`${JSON.stringify({ type: 'listfunds', result: r }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'balance') {
-    const funds = await lnCli({ backend, composeFile, service, network, cliBin, args: ['listfunds'] });
+    const funds = await lnListFunds({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    });
+
+    if (impl === 'lnd') {
+      const confirmedSat = BigInt(String(funds?.wallet?.confirmed_balance ?? 0));
+      const unconfirmedSat = BigInt(String(funds?.wallet?.unconfirmed_balance ?? 0));
+      const channelSat = BigInt(String(funds?.channel?.balance ?? 0));
+      process.stdout.write(`${JSON.stringify({
+        type: 'balance',
+        onchain_confirmed_msat: (confirmedSat * 1000n).toString(),
+        onchain_unconfirmed_msat: (unconfirmedSat * 1000n).toString(),
+        channel_total_msat: (channelSat * 1000n).toString(),
+        raw: funds,
+      }, null, 2)}\n`);
+      return;
+    }
+
     const sums = sumMsatFromFunds(funds);
     process.stdout.write(`${JSON.stringify({
       type: 'balance',
@@ -229,7 +257,21 @@ async function main() {
 
   if (cmd === 'connect') {
     const peer = requireFlag(flags, 'peer');
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: ['connect', peer] });
+    const r = await lnConnect({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { peer });
     process.stdout.write(`${JSON.stringify({ type: 'connect', peer, result: r }, null, 2)}\n`);
     return;
   }
@@ -238,7 +280,21 @@ async function main() {
     const nodeId = requireFlag(flags, 'node-id');
     const amountSats = parseIntFlag(requireFlag(flags, 'amount-sats'), 'amount-sats');
     if (!Number.isFinite(amountSats) || amountSats <= 0) die('Invalid --amount-sats');
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: ['fundchannel', nodeId, String(amountSats)] });
+    const r = await lnFundChannel({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { nodeId, amountSats, block: true });
     process.stdout.write(`${JSON.stringify({ type: 'fundchannel', node_id: nodeId, amount_sats: amountSats, result: r }, null, 2)}\n`);
     return;
   }
@@ -248,39 +304,106 @@ async function main() {
     const label = requireFlag(flags, 'label');
     const desc = requireFlag(flags, 'desc');
     const expiry = flags.get('expiry') ? parseIntFlag(flags.get('expiry'), 'expiry') : null;
-    const cliArgs = ['invoice', msat, label, desc];
-    if (expiry !== null) cliArgs.push(String(expiry));
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: cliArgs });
-    process.stdout.write(`${JSON.stringify({ type: 'invoice', ...r }, null, 2)}\n`);
+    const r = await lnInvoice({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { amountMsat: msat, label, description: desc, expirySec: expiry });
+    process.stdout.write(`${JSON.stringify({ type: 'invoice', bolt11: r.bolt11, payment_hash: r.payment_hash, raw: r.raw }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'decodepay') {
     const bolt11 = requireFlag(flags, 'bolt11');
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: ['decodepay', bolt11] });
+    const r = await lnDecodePay({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { bolt11 });
     process.stdout.write(`${JSON.stringify({ type: 'decodepay', ...r }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'pay') {
     const bolt11 = requireFlag(flags, 'bolt11');
-    const r = await lnCli({ backend, composeFile, service, network, cliBin, args: ['pay', bolt11] });
-    process.stdout.write(`${JSON.stringify({ type: 'pay', ...r }, null, 2)}\n`);
+    const r = await lnPay({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { bolt11 });
+    process.stdout.write(`${JSON.stringify({ type: 'pay', payment_preimage: r.payment_preimage, raw: r.raw }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'pay-status') {
     const hash = normalizeHex32(requireFlag(flags, 'payment-hash'), 'payment-hash');
-    const r = await listPaysMaybe({ backend, composeFile, service, network, cliBin, paymentHashHex: hash });
+    const r = await lnPayStatus({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { paymentHashHex: hash });
     process.stdout.write(`${JSON.stringify({ type: 'pay_status', payment_hash_hex: hash, result: r }, null, 2)}\n`);
     return;
   }
 
   if (cmd === 'preimage-get') {
     const hash = normalizeHex32(requireFlag(flags, 'payment-hash'), 'payment-hash');
-    const r = await listPaysMaybe({ backend, composeFile, service, network, cliBin, paymentHashHex: hash });
-    const preimageHex = extractPreimageHex(r);
-    process.stdout.write(`${JSON.stringify({ type: 'preimage', payment_hash_hex: hash, preimage_hex: preimageHex, result: r }, null, 2)}\n`);
+    const r = await lnPreimageGet({
+      impl,
+      backend,
+      composeFile,
+      service,
+      network,
+      cliBin,
+      cwd: repoRoot,
+      lnd: {
+        rpcserver: flags.get('lnd-rpcserver') ? String(flags.get('lnd-rpcserver')).trim() : '',
+        tlscertpath: flags.get('lnd-tlscert') ? String(flags.get('lnd-tlscert')).trim() : '',
+        macaroonpath: flags.get('lnd-macaroon') ? String(flags.get('lnd-macaroon')).trim() : '',
+        lnddir: flags.get('lnd-dir') ? String(flags.get('lnd-dir')).trim() : '',
+      },
+    }, { paymentHashHex: hash });
+    process.stdout.write(`${JSON.stringify({ type: 'preimage', payment_hash_hex: hash, preimage_hex: r.preimage_hex, result: r }, null, 2)}\n`);
     return;
   }
 

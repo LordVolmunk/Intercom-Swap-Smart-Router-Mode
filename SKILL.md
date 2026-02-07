@@ -100,7 +100,7 @@ This repo also includes `scripts/solprogctl.mjs` (with wrappers `scripts/solprog
 - inspect program ids / program keypairs (`id`, `keypair-pubkey`)
 
 This repo also includes wallet/inventory operator tools (no custodial wallet APIs; keys stay local):
-- `scripts/lnctl.mjs` (with wrappers `scripts/lnctl.sh` and `scripts/lnctl.ps1`) for Core Lightning (CLN) ops:
+- `scripts/lnctl.mjs` (with wrappers `scripts/lnctl.sh` and `scripts/lnctl.ps1`) for Lightning node ops (CLN or LND):
   - on-chain funding address (`newaddr`) + balance (`balance`)
   - invoice/pay/status + preimage lookup (for recovery)
 - `scripts/solctl.mjs` (with wrappers `scripts/solctl.sh` and `scripts/solctl.ps1`) for Solana keypair + SPL token ops:
@@ -121,7 +121,10 @@ This repo also provides long-running OTC “agent bots” that sit in an OTC cha
   - With `--run-swap 1`, it also runs the **full swap state machine** (accept -> verify escrow on-chain -> pay LN -> claim Solana escrow).
 
 `--run-swap 1` requires:
-- LN backend configuration (e2e uses CLN via Docker Compose; production can use local `lightning-cli`).
+- LN backend configuration:
+  - e2e: CLN via Docker Compose (`dev/ln-regtest/docker-compose.yml`)
+  - e2e (adapter coverage): LND via Docker Compose (`dev/lnd-regtest/docker-compose.yml`)
+  - production: recommend **LND Neutrino** (`--bitcoin.node=neutrino`) to avoid running a full `bitcoind` on mainnet
 - Solana RPC + keypair paths stored under `onchain/` + the SPL mint (`USDT` on mainnet).
 
 These bots are designed for:
@@ -901,6 +904,7 @@ npm run test:e2e
 
 What `npm run test:e2e` does:
 - Starts LN regtest via `dev/ln-regtest/docker-compose.yml` (bitcoind + CLN alice/bob).
+- Starts LN regtest via `dev/lnd-regtest/docker-compose.yml` (bitcoind + LND alice/bob) for LND adapter coverage.
 - Builds + loads the Solana escrow program into a local `solana-test-validator`.
 - Spawns 3 Intercom peers via Pear:
   - `alice`: service/escrow depositor + LN invoice receiver (channel owner).
@@ -909,11 +913,18 @@ What `npm run test:e2e` does:
 - Runs the OTC maker/taker bots (`scripts/otc-maker.mjs`, `scripts/otc-taker.mjs`) in `--run-swap 1` mode to execute the full swap inside the invite-only swap channel.
 
 ### Production Notes (Not Implemented Here Yet)
-- Lightning mainnet/testnet: run your own CLN/LND and connect via RPC credentials stored under `onchain/`.
+- Lightning mainnet/testnet: run your own CLN/LND and connect via local RPC credentials stored under `onchain/`.
+  - **Mainnet recommendation:** LND in Neutrino mode (no `bitcoind`).
 - Solana mainnet: prefer an RPC provider; self-hosting Solana RPC is operationally heavy and storage-intensive.
 
-Lightning (CLN) network flag reminder:
-- mainnet uses `--ln-network bitcoin` (alias supported by our scripts: `mainnet`)
+Lightning network flag reminder:
+- CLN mainnet is `--ln-network bitcoin`
+- LND mainnet is `--ln-network mainnet` (we also accept `bitcoin` as an alias)
+
+LND Neutrino (no `bitcoind`) runtime notes (mainnet/testnet/signet):
+- Start `lnd` with `--bitcoin.node=neutrino` and at least one `--neutrino.addpeer=<host:port>` (or `--neutrino.connect=...`) so it can find peers.
+- Store all LND runtime data, tls certs, and macaroons under `onchain/lnd/<network>/<nodeName>/` (gitignored).
+- Do **not** use `--noseedbackup` on mainnet (only used in regtest e2e).
 
 ### Live Ops Checklist (Devnet/Testnet -> Mainnet)
 Goal: a fully scripted path so the only manual input is "fund these addresses" (SOL + USDT + LN liquidity).
@@ -977,10 +988,23 @@ scripts/escrowctl.sh config-get --solana-rpc-url <rpc>
 Lightning (local node only; no wallet-service APIs):
 ```bash
 # Example: query a running CLN node (CLI backend).
-scripts/lnctl.sh info --backend cli --network bitcoin
+scripts/lnctl.sh info --impl cln --backend cli --network bitcoin
+
+# Example: query a running LND node (CLI backend).
+# Store tls cert + macaroon under onchain/ (gitignored).
+scripts/lnctl.sh info --impl lnd --backend cli --network mainnet \
+  --lnd-rpcserver 127.0.0.1:10009 \
+  --lnd-tlscert onchain/lnd/mainnet/tls.cert \
+  --lnd-macaroon onchain/lnd/mainnet/admin.macaroon
 
 # Funding address for your CLN node's on-chain wallet (used to get liquidity into LN):
-scripts/lnctl.sh newaddr --backend cli --network bitcoin
+scripts/lnctl.sh newaddr --impl cln --backend cli --network bitcoin
+
+# Funding address for your LND node's on-chain wallet:
+scripts/lnctl.sh newaddr --impl lnd --backend cli --network mainnet \
+  --lnd-rpcserver 127.0.0.1:10009 \
+  --lnd-tlscert onchain/lnd/mainnet/tls.cert \
+  --lnd-macaroon onchain/lnd/mainnet/admin.macaroon
 ```
 
 Intercom + bots (symmetrical, both sides can quote/RFQ/invite):
@@ -1017,13 +1041,15 @@ scripts/swapctl-peer.sh swap-maker 49222 svc-announce-loop \
 # Start OTC bots (pass the live RPC + keypairs + mint; both default to otc-channel 0000intercomswapbtcusdt)
 scripts/otc-maker-peer.sh swap-maker 49222 \
   --run-swap 1 \
-  --ln-backend cli --ln-network bitcoin \
+  --ln-impl lnd --ln-backend cli --ln-network mainnet \
+  --lnd-rpcserver 127.0.0.1:10009 --lnd-tlscert onchain/lnd/mainnet/tls.cert --lnd-macaroon onchain/lnd/mainnet/admin.macaroon \
   --solana-rpc-url <rpc> --solana-keypair onchain/solana/keypairs/swap-maker-sol.json --solana-mint <USDT_MINT> \
   --solana-trade-fee-collector <TRADE_FEE_COLLECTOR_PUBKEY>
 
 scripts/otc-taker-peer.sh swap-taker 49223 \
   --run-swap 1 \
-  --ln-backend cli --ln-network bitcoin \
+  --ln-impl lnd --ln-backend cli --ln-network mainnet \
+  --lnd-rpcserver 127.0.0.1:10009 --lnd-tlscert onchain/lnd/mainnet/tls.cert --lnd-macaroon onchain/lnd/mainnet/admin.macaroon \
   --solana-rpc-url <rpc> --solana-keypair onchain/solana/keypairs/swap-taker-sol.json --solana-mint <USDT_MINT>
 ```
 
