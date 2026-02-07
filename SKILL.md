@@ -134,6 +134,10 @@ This repo also provides long-running OTC “agent bots” that sit in an OTC cha
   - e2e: CLN via Docker Compose (`dev/ln-regtest/docker-compose.yml`)
   - e2e (adapter coverage): LND via Docker Compose (`dev/lnd-regtest/docker-compose.yml`)
   - production: recommend **LND Neutrino** (`--bitcoin.node=neutrino`) to avoid running a full `bitcoind` on mainnet
+- LN liquidity prerequisites:
+  - Swaps will fail if the payer has no outbound liquidity, or the invoice receiver has no inbound liquidity.
+  - Channels are not opened per trade. Open channels ahead of time (or rely on routing if you have a well-connected node).
+  - See: "Live Ops Checklist" -> "Lightning liquidity prerequisites".
 - Solana RPC + keypair paths stored under `onchain/` + the SPL mint (`USDT` on mainnet).
 
 These bots are designed for:
