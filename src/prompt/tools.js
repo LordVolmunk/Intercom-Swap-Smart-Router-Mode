@@ -254,6 +254,84 @@ export const INTERCOMSWAP_TOOLS = [
   }),
 
   // RFQ / swap envelope helpers (Phase 5B executor will translate to swapctl+sign safely).
+  tool(
+    'intercomswap_offer_post',
+    'Post a signed Offer announcement (swap.svc_announce) into rendezvous channels (advertise: have USDT, want BTC; prompts BTC sellers to post matching RFQs).',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channels: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 20,
+          items: channelParam,
+          description: 'Rendezvous channels to broadcast the offer announcement into.',
+        },
+        trade_id: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'Optional stable id for the announcement. If omitted, derived from name.',
+        },
+        name: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'Short label shown to peers (example: "maker:alice").',
+        },
+        rfq_channels: {
+          type: 'array',
+          minItems: 0,
+          maxItems: 20,
+          items: channelParam,
+          description: 'Where BTC sellers should post the matching RFQ (defaults to the same channels).',
+        },
+        ttl_sec: {
+          type: 'integer',
+          minimum: 10,
+          maximum: 7 * 24 * 3600,
+          description: 'Optional TTL for the announcement (seconds). Used to compute valid_until_unix.',
+        },
+        valid_until_unix: { ...unixSecParam, description: 'Optional expiry for the announcement (unix seconds).' },
+        offers: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 20,
+          description: 'Structured offers. These mirror RFQ fields so a seller can post an RFQ with minimal back-and-forth.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              pair: { type: 'string', enum: ['BTC_LN/USDT_SOL'] },
+              have: { type: 'string', enum: ['USDT_SOL'] },
+              want: { type: 'string', enum: ['BTC_LN'] },
+              btc_sats: satsParam,
+              usdt_amount: atomicAmountParam,
+              max_platform_fee_bps: { type: 'integer', minimum: 0, maximum: 500 },
+              max_trade_fee_bps: { type: 'integer', minimum: 0, maximum: 1000 },
+              max_total_fee_bps: { type: 'integer', minimum: 0, maximum: 1500 },
+              min_sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600 },
+              max_sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600 },
+            },
+            required: [
+              'pair',
+              'have',
+              'want',
+              'btc_sats',
+              'usdt_amount',
+              'max_platform_fee_bps',
+              'max_trade_fee_bps',
+              'max_total_fee_bps',
+              'min_sol_refund_window_sec',
+              'max_sol_refund_window_sec',
+            ],
+          },
+        },
+      },
+      required: ['channels', 'name', 'offers'],
+    }
+  ),
   tool('intercomswap_rfq_post', 'Post a signed RFQ envelope into an RFQ rendezvous channel (BTC_LN->USDT_SOL: sell BTC for USDT).', {
     type: 'object',
     additionalProperties: false,

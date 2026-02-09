@@ -34,6 +34,7 @@ ${roleBlock}
 
 Tool cookbook (preferred patterns):
 - Listen for signed swap envelopes: \`intercomswap_sc_subscribe\` then \`intercomswap_sc_wait_envelope\`.
+- Post an Offer announcement (maker presence; have USDT, want BTC): \`intercomswap_offer_post\`.
 - Post an RFQ into a rendezvous channel: \`intercomswap_rfq_post\` (do NOT use \`intercomswap_sc_open\` for normal RFQ posting).
 - Quote an RFQ (maker): \`intercomswap_quote_post_from_rfq\` (preferred) or \`intercomswap_quote_post\`.
 - Accept a quote (taker): \`intercomswap_quote_accept\`.

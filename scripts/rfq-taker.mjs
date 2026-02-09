@@ -88,6 +88,15 @@ function parseBps(value, label, fallback) {
   return Math.max(0, Math.min(10_000, n));
 }
 
+function splitCsv(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return [];
+  return s
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
 function stripSignature(envelope) {
   if (!envelope || typeof envelope !== 'object') return envelope;
   const { sig: _sig, signer: _signer, ...unsigned } = envelope;
@@ -148,14 +157,21 @@ async function main() {
   const token = requireFlag(flags, 'token');
   const peerKeypairPath = requireFlag(flags, 'peer-keypair');
   const rfqChannel = (flags.get('rfq-channel') && String(flags.get('rfq-channel')).trim()) || '0000intercomswapbtcusdt';
+  const listenOffers = parseBool(flags.get('listen-offers'), false);
+  const offerChannels = (() => {
+    const raw = flags.get('offer-channels') ?? flags.get('offer-channel') ?? '';
+    const chans = splitCsv(raw);
+    const list = chans.length > 0 ? chans : [rfqChannel];
+    return Array.from(new Set(list.map((c) => String(c || '').trim()).filter(Boolean)));
+  })();
   const receiptsDbPath = flags.get('receipts-db') ? String(flags.get('receipts-db')).trim() : '';
   const persistPreimage = parseBool(flags.get('persist-preimage'), receiptsDbPath ? true : false);
   const stopAfterLnPay = parseBool(flags.get('stop-after-ln-pay'), false);
 
   const tradeId = (flags.get('trade-id') && String(flags.get('trade-id')).trim()) || `swap_${crypto.randomUUID()}`;
 
-  const btcSats = parseIntFlag(flags.get('btc-sats'), 'btc-sats', 50_000);
-  const usdtAmount = (flags.get('usdt-amount') && String(flags.get('usdt-amount')).trim()) || '100000000';
+  let btcSats = parseIntFlag(flags.get('btc-sats'), 'btc-sats', 50_000);
+  let usdtAmount = (flags.get('usdt-amount') && String(flags.get('usdt-amount')).trim()) || '100000000';
   const rfqValidSec = parseIntFlag(flags.get('rfq-valid-sec'), 'rfq-valid-sec', 60);
 
   const timeoutSec = parseIntFlag(flags.get('timeout-sec'), 'timeout-sec', 30);
@@ -175,19 +191,42 @@ async function main() {
   const swapResendMs = parseIntFlag(flags.get('swap-resend-ms'), 'swap-resend-ms', 1200);
   // Guardrail: require the Solana refund timelock in TERMS to be far enough in the future
   // to allow recovery (crash/restart/RPC outage) after paying the LN invoice.
-  const minSolRefundWindowSec = parseIntFlag(
+  const minSolRefundWindowSecCfg = parseIntFlag(
     flags.get('min-solana-refund-window-sec'),
     'min-solana-refund-window-sec',
     72 * 3600
   );
-  const maxSolRefundWindowSec = parseIntFlag(
+  const maxSolRefundWindowSecCfg = parseIntFlag(
     flags.get('max-solana-refund-window-sec'),
     'max-solana-refund-window-sec',
     7 * 24 * 3600
   );
-  const maxPlatformFeeBps = parseBps(flags.get('max-platform-fee-bps'), 'max-platform-fee-bps', 500);
-  const maxTradeFeeBps = parseBps(flags.get('max-trade-fee-bps'), 'max-trade-fee-bps', 1000);
-  const maxTotalFeeBps = parseBps(flags.get('max-total-fee-bps'), 'max-total-fee-bps', 1500);
+  const maxPlatformFeeBpsCfg = parseBps(flags.get('max-platform-fee-bps'), 'max-platform-fee-bps', 500);
+  const maxTradeFeeBpsCfg = parseBps(flags.get('max-trade-fee-bps'), 'max-trade-fee-bps', 1000);
+  const maxTotalFeeBpsCfg = parseBps(flags.get('max-total-fee-bps'), 'max-total-fee-bps', 1500);
+
+  const SOL_REFUND_MIN_SEC = 3600; // 1h
+  const SOL_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
+  if (!Number.isFinite(minSolRefundWindowSecCfg) || minSolRefundWindowSecCfg < SOL_REFUND_MIN_SEC) {
+    die(`Invalid --min-solana-refund-window-sec (must be >= ${SOL_REFUND_MIN_SEC})`);
+  }
+  if (!Number.isFinite(maxSolRefundWindowSecCfg) || maxSolRefundWindowSecCfg > SOL_REFUND_MAX_SEC) {
+    die(`Invalid --max-solana-refund-window-sec (must be <= ${SOL_REFUND_MAX_SEC})`);
+  }
+  if (minSolRefundWindowSecCfg > maxSolRefundWindowSecCfg) {
+    die('Invalid Solana refund window range (min > max)');
+  }
+  if (maxPlatformFeeBpsCfg > 500) die('Invalid --max-platform-fee-bps (must be <= 500)');
+  if (maxTradeFeeBpsCfg > 1000) die('Invalid --max-trade-fee-bps (must be <= 1000)');
+  if (maxTotalFeeBpsCfg > 1500) die('Invalid --max-total-fee-bps (must be <= 1500)');
+
+  // The actual RFQ we post uses these variables. When listening to offers, they can be overridden
+  // (but still constrained by the configured guardrails above).
+  let minSolRefundWindowSec = minSolRefundWindowSecCfg;
+  let maxSolRefundWindowSec = maxSolRefundWindowSecCfg;
+  let maxPlatformFeeBps = maxPlatformFeeBpsCfg;
+  let maxTradeFeeBps = maxTradeFeeBpsCfg;
+  let maxTotalFeeBps = maxTotalFeeBpsCfg;
 
   const solRpcUrl = (flags.get('solana-rpc-url') && String(flags.get('solana-rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
@@ -244,8 +283,11 @@ async function main() {
   const sc = new ScBridgeClient({ url, token });
   await sc.connect();
 
-  ensureOk(await sc.join(rfqChannel), `join ${rfqChannel}`);
-  ensureOk(await sc.subscribe([rfqChannel]), `subscribe ${rfqChannel}`);
+  const joinedChannels = Array.from(new Set([rfqChannel, ...(listenOffers ? offerChannels : [])]));
+  for (const ch of joinedChannels) {
+    ensureOk(await sc.join(ch), `join ${ch}`);
+  }
+  ensureOk(await sc.subscribe(joinedChannels), `subscribe ${joinedChannels.join(',')}`);
 
   const takerPubkey = String(sc.hello?.peer || '').trim().toLowerCase();
   if (!takerPubkey) die('SC-Bridge hello missing peer pubkey');
@@ -301,7 +343,132 @@ async function main() {
       })()
     : null;
 
+  let offerMeta = null;
+  if (listenOffers) {
+    const offerWaitMs = Math.max(5_000, Math.trunc(Number(timeoutSec || 30) * 1000));
+    process.stdout.write(
+      `${JSON.stringify({ type: 'waiting_offer', offer_channels: offerChannels, rfq_channel: rfqChannel, trade_id: tradeId, pubkey: takerPubkey })}\n`
+    );
+
+    offerMeta = await new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => {
+        cleanup();
+        reject(new Error(`offer wait timeout after ${offerWaitMs}ms`));
+      }, offerWaitMs);
+
+      const cleanup = () => {
+        clearTimeout(deadline);
+        sc.off('sidechannel_message', onMsg);
+      };
+
+      const onMsg = (evt) => {
+        try {
+          if (!evt || evt.type !== 'sidechannel_message') return;
+          if (!offerChannels.includes(String(evt.channel || ''))) return;
+          const msg = evt.message;
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.kind !== KIND.SVC_ANNOUNCE) return;
+          const v = validateSwapEnvelope(msg);
+          if (!v.ok) return;
+          const body = msg.body;
+          if (!body || typeof body !== 'object') return;
+
+          const now = Math.floor(Date.now() / 1000);
+          const until = Number(body.valid_until_unix);
+          if (Number.isFinite(until) && until <= now) return;
+
+          // If the maker included rfq_channels, ensure ours is included to minimize chatter.
+          if (Array.isArray(body.rfq_channels) && body.rfq_channels.length > 0) {
+            const set = new Set(body.rfq_channels.map((c) => String(c || '').trim()).filter(Boolean));
+            if (!set.has(rfqChannel)) return;
+          }
+
+          const offers = Array.isArray(body.offers) ? body.offers : [];
+          if (offers.length < 1) return;
+
+          for (const o of offers) {
+            if (!o || typeof o !== 'object') continue;
+            if (String(o.pair || '') !== PAIR.BTC_LN__USDT_SOL) continue;
+            if (String(o.have || '') !== ASSET.USDT_SOL) continue;
+            if (String(o.want || '') !== ASSET.BTC_LN) continue;
+
+            const appHash = String(o.app_hash || body.app_hash || '').trim().toLowerCase();
+            if (!appHash || appHash !== expectedAppHash) continue;
+
+            const btc = Number(o.btc_sats);
+            if (!Number.isInteger(btc) || btc < 1) continue;
+            const usdt = String(o.usdt_amount || '').trim();
+            if (!/^[0-9]+$/.test(usdt)) continue;
+
+            const maxPlat = Number(o.max_platform_fee_bps);
+            const maxTrade = Number(o.max_trade_fee_bps);
+            const maxTotal = Number(o.max_total_fee_bps);
+            if (!Number.isInteger(maxPlat) || maxPlat < 0 || maxPlat > 500) continue;
+            if (!Number.isInteger(maxTrade) || maxTrade < 0 || maxTrade > 1000) continue;
+            if (!Number.isInteger(maxTotal) || maxTotal < 0 || maxTotal > 1500) continue;
+            if (maxPlat > maxPlatformFeeBpsCfg) continue;
+            if (maxTrade > maxTradeFeeBpsCfg) continue;
+            if (maxTotal > maxTotalFeeBpsCfg) continue;
+
+            const minWin = Number(o.min_sol_refund_window_sec);
+            const maxWin = Number(o.max_sol_refund_window_sec);
+            if (!Number.isInteger(minWin) || minWin < SOL_REFUND_MIN_SEC || minWin > SOL_REFUND_MAX_SEC) continue;
+            if (!Number.isInteger(maxWin) || maxWin < SOL_REFUND_MIN_SEC || maxWin > SOL_REFUND_MAX_SEC) continue;
+            if (minWin > maxWin) continue;
+            if (minWin < minSolRefundWindowSecCfg) continue;
+            if (maxWin > maxSolRefundWindowSecCfg) continue;
+
+            cleanup();
+            resolve({
+              offer_channel: String(evt.channel || ''),
+              offer_name: String(body.name || ''),
+              offer_signer: String(msg.signer || '').trim().toLowerCase() || null,
+              offer_valid_until_unix: Number.isFinite(until) ? until : null,
+              // RFQ mirror values
+              btc_sats: btc,
+              usdt_amount: usdt,
+              max_platform_fee_bps: maxPlat,
+              max_trade_fee_bps: maxTrade,
+              max_total_fee_bps: maxTotal,
+              min_sol_refund_window_sec: minWin,
+              max_sol_refund_window_sec: maxWin,
+            });
+            return;
+          }
+        } catch (err) {
+          cleanup();
+          reject(err);
+        }
+      };
+
+      sc.on('sidechannel_message', onMsg);
+    });
+
+    btcSats = offerMeta.btc_sats;
+    usdtAmount = offerMeta.usdt_amount;
+    maxPlatformFeeBps = offerMeta.max_platform_fee_bps;
+    maxTradeFeeBps = offerMeta.max_trade_fee_bps;
+    maxTotalFeeBps = offerMeta.max_total_fee_bps;
+    minSolRefundWindowSec = offerMeta.min_sol_refund_window_sec;
+    maxSolRefundWindowSec = offerMeta.max_sol_refund_window_sec;
+
+    process.stdout.write(
+      `${JSON.stringify({
+        type: 'offer_matched',
+        trade_id: tradeId,
+        offer_channel: offerMeta.offer_channel,
+        offer_name: offerMeta.offer_name,
+        btc_sats: btcSats,
+        usdt_amount: usdtAmount,
+      })}\n`
+    );
+  }
+
   const nowSec = Math.floor(Date.now() / 1000);
+  let rfqValidUntil = nowSec + rfqValidSec;
+  if (offerMeta && Number.isFinite(offerMeta.offer_valid_until_unix) && offerMeta.offer_valid_until_unix > 0) {
+    rfqValidUntil = Math.min(rfqValidUntil, Math.trunc(offerMeta.offer_valid_until_unix));
+  }
   const rfqUnsigned = createUnsignedEnvelope({
     v: 1,
     kind: KIND.RFQ,
@@ -322,7 +489,7 @@ async function main() {
       max_sol_refund_window_sec: maxSolRefundWindowSec,
       ...(runSwap ? { sol_recipient: sol.payer.publicKey.toBase58() } : {}),
       ...(runSwap && solMintStr ? { sol_mint: solMintStr } : {}),
-      valid_until_unix: nowSec + rfqValidSec,
+      valid_until_unix: rfqValidUntil,
     },
   });
   const rfqId = hashUnsignedEnvelope(rfqUnsigned);

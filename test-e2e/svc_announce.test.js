@@ -147,6 +147,42 @@ async function connectBridge(sc, label) {
   );
 }
 
+function ensureOk(res, label) {
+  if (!res || typeof res !== 'object') throw new Error(`${label} failed (no response)`);
+  if (res.type === 'error') throw new Error(`${label} failed: ${res.error}`);
+  return res;
+}
+
+function waitForSidechannel(sc, { channel, pred, timeoutMs = 10_000, label = 'waitForSidechannel' }) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`${label} timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    const onMsg = (evt) => {
+      try {
+        if (!evt || evt.type !== 'sidechannel_message') return;
+        if (channel && evt.channel !== channel) return;
+        if (!pred || pred(evt.message, evt)) {
+          cleanup();
+          resolve(evt);
+        }
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      sc.off('sidechannel_message', onMsg);
+    };
+
+    sc.on('sidechannel_message', onMsg);
+  });
+}
+
 function spawnPromptd({ configPath, label }) {
   const proc = spawn('node', ['scripts/promptd.mjs', '--config', configPath], {
     cwd: repoRoot,
@@ -684,5 +720,230 @@ test('e2e: svc_announce re-broadcast reaches late joiners', async (t) => {
     { label: 'observe svc_announce', tries: 40, delayMs: 250 }
   );
 
+  listenerSc.close();
+});
+
+test('e2e: prompt tool offer_post broadcasts swap.svc_announce', async (t) => {
+  const runId = crypto.randomBytes(4).toString('hex');
+
+  // Local DHT bootstrapper for reliability.
+  const dhtPort = 30000 + crypto.randomInt(0, 10000);
+  const dht = DHT.bootstrapper(dhtPort, '127.0.0.1');
+  await dht.ready();
+  const dhtBootstrap = `127.0.0.1:${dhtPort}`;
+  t.after(async () => {
+    try {
+      await dht.destroy({ force: true });
+    } catch (_e) {}
+  });
+
+  const channel = `svc-offer-${runId}`;
+
+  const storesDir = path.join(repoRoot, 'stores');
+  const announcerStore = `e2e-offer-tool-announcer-${runId}`;
+  const listenerStore = `e2e-offer-tool-listener-${runId}`;
+  const announcerKeys = await writePeerKeypair({ storesDir, storeName: announcerStore });
+  await writePeerKeypair({ storesDir, storeName: listenerStore });
+  const listenerKeypairPath = path.join(storesDir, listenerStore, 'db', 'keypair.json');
+
+  const announcerToken = `token-announcer-offer-${runId}`;
+  const listenerToken = `token-listener-offer-${runId}`;
+  const [announcerPort, listenerPort] = await pickFreePorts(2);
+
+  const announcerPeer = spawnPeer(
+    [
+      '--peer-store-name',
+      announcerStore,
+      '--subnet-channel',
+      `e2e-offer-subnet-${runId}`,
+      '--msb',
+      '0',
+      '--dht-bootstrap',
+      dhtBootstrap,
+      '--sc-bridge',
+      '1',
+      '--sc-bridge-token',
+      announcerToken,
+      '--sc-bridge-port',
+      String(announcerPort),
+      '--sidechannel-pow',
+      '0',
+      '--sidechannel-welcome-required',
+      '0',
+    ],
+    { label: 'announcer-offer-tool' }
+  );
+  t.after(async () => {
+    await killProc(announcerPeer.proc);
+  });
+
+  const listenerPeer = spawnPeer(
+    [
+      '--peer-store-name',
+      listenerStore,
+      '--subnet-channel',
+      `e2e-offer-subnet-${runId}`,
+      '--msb',
+      '0',
+      '--dht-bootstrap',
+      dhtBootstrap,
+      '--sc-bridge',
+      '1',
+      '--sc-bridge-token',
+      listenerToken,
+      '--sc-bridge-port',
+      String(listenerPort),
+      '--sidechannel-pow',
+      '0',
+      '--sidechannel-welcome-required',
+      '0',
+    ],
+    { label: 'listener-offer-tool' }
+  );
+  t.after(async () => {
+    await killProc(listenerPeer.proc);
+  });
+
+  const announcerSc = new ScBridgeClient({ url: `ws://127.0.0.1:${announcerPort}`, token: announcerToken });
+  const listenerSc = new ScBridgeClient({ url: `ws://127.0.0.1:${listenerPort}`, token: listenerToken });
+  await connectBridge(announcerSc, 'announcer sc-bridge (offer)');
+  await connectBridge(listenerSc, 'listener sc-bridge (offer)');
+
+  await retry(async () => {
+    const s = await announcerSc.stats();
+    if (s.type !== 'stats' || s.sidechannelStarted !== true) throw new Error('announcer sidechannel not started');
+  }, { label: 'announcer sidechannel started', tries: 200, delayMs: 250 });
+  await retry(async () => {
+    const s = await listenerSc.stats();
+    if (s.type !== 'stats' || s.sidechannelStarted !== true) throw new Error('listener sidechannel not started');
+  }, { label: 'listener sidechannel started', tries: 200, delayMs: 250 });
+
+  // Ensure both peers are joined for delivery.
+  ensureOk(await announcerSc.join(channel), `join ${channel} (announcer)`);
+  ensureOk(await listenerSc.join(channel), `join ${channel} (listener)`);
+  ensureOk(await announcerSc.subscribe([channel]), `subscribe ${channel} (announcer)`);
+  ensureOk(await listenerSc.subscribe([channel]), `subscribe ${channel} (listener)`);
+
+  // Fake OpenAI endpoint so promptd can boot, even though we only use direct-tool mode here.
+  const llm = await startFakeLlmServer({ toolName: 'intercomswap_sc_stats' });
+  t.after(async () => {
+    try {
+      await llm.stop();
+    } catch (_e) {}
+  });
+
+  const promptdToken = `promptd-auth-offer-${runId}`;
+  const promptdPort = await pickFreePort();
+  const promptdCfg = path.join(repoRoot, `onchain/prompt/e2e-offer-post-${runId}.json`);
+  fs.mkdirSync(path.dirname(promptdCfg), { recursive: true });
+  fs.writeFileSync(
+    promptdCfg,
+    JSON.stringify(
+      {
+        agent: { role: 'maker' },
+        peer: { keypair: announcerKeys.keyPairPath },
+        llm: { base_url: llm.baseUrl, api_key: '', model: 'fake', response_format: { type: 'json_object' } },
+        server: {
+          host: '127.0.0.1',
+          port: promptdPort,
+          audit_dir: `onchain/prompt/audit-e2e-offer-${runId}`,
+          auth_token: promptdToken,
+          auto_approve_default: false,
+          max_steps: 4,
+          max_repairs: 0,
+        },
+        sc_bridge: { url: `ws://127.0.0.1:${announcerPort}`, token: announcerToken },
+        receipts: { db: `onchain/receipts/e2e-offer-post-${runId}.sqlite` },
+        ln: { impl: 'cln', backend: 'cli', network: 'regtest' },
+        solana: { rpc_url: 'http://127.0.0.1:8899', commitment: 'confirmed', program_id: '', keypair: '' },
+      },
+      null,
+      2
+    )
+  );
+
+  const promptd = spawnPromptd({ configPath: promptdCfg, label: 'promptd-offer-post' });
+  t.after(async () => {
+    await killProc(promptd.proc);
+  });
+  const listen = await promptd.waitReady();
+  const base = `http://${listen.host}:${listen.port}`;
+  const authHeaders = { authorization: `Bearer ${promptdToken}` };
+
+  // Sidechannels are unbuffered: ensure connectivity right before the one-shot prompt-tool broadcast.
+  // (Connections can go idle while promptd boots.)
+  const preflight = {
+    kind: KIND.SVC_ANNOUNCE,
+    trade_id: `preflight_${runId}`,
+    body: { name: `preflight:${runId}` },
+  };
+  const preflightWait = waitForSidechannel(listenerSc, {
+    channel,
+    pred: (m) => m?.kind === KIND.SVC_ANNOUNCE && String(m?.body?.name || '') === `preflight:${runId}`,
+    timeoutMs: 20_000,
+    label: 'preflight delivery',
+  });
+  ensureOk(await announcerSc.send(channel, preflight), 'send preflight (initial)');
+  let preflightStop = false;
+  const preflightResender = setInterval(async () => {
+    if (preflightStop) return;
+    try {
+      await announcerSc.send(channel, preflight);
+    } catch (_e) {}
+  }, 250);
+  t.after(() => clearInterval(preflightResender));
+  await preflightWait;
+
+  const offerWait = waitForSidechannel(listenerSc, {
+    channel,
+    pred: (m) => m?.kind === KIND.SVC_ANNOUNCE && String(m?.body?.name || '') === `maker:${runId}`,
+    timeoutMs: 20_000,
+    label: 'observe offer svc_announce',
+  });
+
+  const events = await readNdjsonUntilFinal({
+    url: `${base}/v1/run/stream`,
+    headers: authHeaders,
+    body: {
+      prompt: JSON.stringify({
+        type: 'tool',
+        name: 'intercomswap_offer_post',
+        arguments: {
+          channels: [channel],
+          name: `maker:${runId}`,
+          rfq_channels: [channel],
+          ttl_sec: 30,
+          offers: [
+            {
+              pair: 'BTC_LN/USDT_SOL',
+              have: 'USDT_SOL',
+              want: 'BTC_LN',
+              btc_sats: 10000,
+              usdt_amount: '1000000',
+              max_platform_fee_bps: 500,
+              max_trade_fee_bps: 1000,
+              max_total_fee_bps: 1500,
+              min_sol_refund_window_sec: 72 * 3600,
+              max_sol_refund_window_sec: 7 * 24 * 3600,
+            },
+          ],
+        },
+      }),
+      session_id: `e2e-offer-post-${runId}`,
+      auto_approve: true,
+      dry_run: false,
+      max_steps: 1,
+    },
+    timeoutMs: 30_000,
+  });
+  const final = events.findLast((e) => e && typeof e === 'object' && e.type === 'final');
+  assert.equal(final?.content_json?.type, 'offer_posted');
+
+  await offerWait;
+
+  preflightStop = true;
+  clearInterval(preflightResender);
+
+  announcerSc.close();
   listenerSc.close();
 });

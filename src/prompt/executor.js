@@ -929,6 +929,145 @@ export class ToolExecutor {
     }
 
     // RFQ / swap envelopes (signed + broadcast)
+    if (toolName === 'intercomswap_offer_post') {
+      assertAllowedKeys(args, toolName, ['channels', 'trade_id', 'name', 'rfq_channels', 'ttl_sec', 'valid_until_unix', 'offers']);
+      requireApproval(toolName, autoApprove);
+
+      if (!Array.isArray(args.channels) || args.channels.length < 1) {
+        throw new Error(`${toolName}: channels must be a non-empty array`);
+      }
+      const channels = Array.from(
+        new Set(args.channels.map((c) => normalizeChannelName(expectString({ c }, toolName, 'c', { max: 128 }))))
+      );
+      if (channels.length < 1) throw new Error(`${toolName}: channels must be a non-empty array`);
+
+      const tradeId =
+        expectOptionalString(args, toolName, 'trade_id', { min: 1, max: 128, pattern: /^[A-Za-z0-9_.:-]+$/ }) ||
+        `svc:${expectString(args, toolName, 'name', { min: 1, max: 128 })
+          .replaceAll(/\s+/g, '-')
+          .replaceAll(/[^A-Za-z0-9_.:-]/g, '')
+          .slice(0, 64)}`;
+
+      const name = expectString(args, toolName, 'name', { min: 1, max: 128 });
+      if (/[\r\n]/.test(name)) throw new Error(`${toolName}: name must not contain newlines`);
+
+      const rfqChannelsRaw = Array.isArray(args.rfq_channels) ? args.rfq_channels : [];
+      const rfqChannels = Array.from(
+        new Set(
+          (rfqChannelsRaw.length > 0 ? rfqChannelsRaw : channels).map((c) =>
+            normalizeChannelName(expectString({ c }, toolName, 'c', { max: 128 }))
+          )
+        )
+      );
+
+      const ttlSec = expectOptionalInt(args, toolName, 'ttl_sec', { min: 10, max: 7 * 24 * 3600 });
+      const validUntilRaw = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
+      if (ttlSec !== null && validUntilRaw !== null) {
+        throw new Error(`${toolName}: provide at most one of ttl_sec or valid_until_unix`);
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      const validUntil = validUntilRaw ?? (ttlSec !== null ? nowSec + ttlSec : nowSec + 300); // default: 5 minutes
+
+      if (!Array.isArray(args.offers) || args.offers.length < 1) {
+        throw new Error(`${toolName}: offers must be a non-empty array`);
+      }
+      if (args.offers.length > 20) throw new Error(`${toolName}: offers too long (max 20)`);
+
+      const maxOffers = [];
+      for (let i = 0; i < args.offers.length; i += 1) {
+        const offer = args.offers[i];
+        if (!isObject(offer)) throw new Error(`${toolName}: offers[${i}] must be an object`);
+        const allowed = [
+          'pair',
+          'have',
+          'want',
+          'btc_sats',
+          'usdt_amount',
+          'max_platform_fee_bps',
+          'max_trade_fee_bps',
+          'max_total_fee_bps',
+          'min_sol_refund_window_sec',
+          'max_sol_refund_window_sec',
+        ];
+        for (const k of Object.keys(offer)) {
+          if (!allowed.includes(k)) throw new Error(`${toolName}: offers[${i}].${k} unexpected`);
+        }
+
+        const pair = expectString(offer, toolName, 'pair', { min: 1, max: 64 });
+        if (pair !== PAIR.BTC_LN__USDT_SOL) throw new Error(`${toolName}: offers[${i}].pair unsupported`);
+        const have = expectString(offer, toolName, 'have', { min: 1, max: 32 });
+        const want = expectString(offer, toolName, 'want', { min: 1, max: 32 });
+        if (have !== ASSET.USDT_SOL) throw new Error(`${toolName}: offers[${i}].have must be ${ASSET.USDT_SOL}`);
+        if (want !== ASSET.BTC_LN) throw new Error(`${toolName}: offers[${i}].want must be ${ASSET.BTC_LN}`);
+
+        const btcSats = expectInt(offer, toolName, 'btc_sats', { min: 1 });
+        const usdtAmount = normalizeAtomicAmount(expectString(offer, toolName, 'usdt_amount', { max: 64 }), `offers[${i}].usdt_amount`);
+
+        const maxPlatformFeeBps = expectInt(offer, toolName, 'max_platform_fee_bps', { min: 0, max: 500 });
+        const maxTradeFeeBps = expectInt(offer, toolName, 'max_trade_fee_bps', { min: 0, max: 1000 });
+        const maxTotalFeeBps = expectInt(offer, toolName, 'max_total_fee_bps', { min: 0, max: 1500 });
+        if (maxPlatformFeeBps + maxTradeFeeBps > maxTotalFeeBps) {
+          throw new Error(`${toolName}: offers[${i}] max_total_fee_bps must be >= platform+trade`);
+        }
+
+        const minWin = expectInt(offer, toolName, 'min_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC });
+        const maxWin = expectInt(offer, toolName, 'max_sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC });
+        if (minWin > maxWin) throw new Error(`${toolName}: offers[${i}] min_sol_refund_window_sec must be <= max_sol_refund_window_sec`);
+
+        maxOffers.push({
+          pair,
+          have,
+          want,
+          btc_sats: btcSats,
+          usdt_amount: usdtAmount,
+          max_platform_fee_bps: maxPlatformFeeBps,
+          max_trade_fee_bps: maxTradeFeeBps,
+          max_total_fee_bps: maxTotalFeeBps,
+          min_sol_refund_window_sec: minWin,
+          max_sol_refund_window_sec: maxWin,
+        });
+      }
+
+      const programId = this._programId().toBase58();
+      const appHash = deriveIntercomswapAppHash({ solanaProgramId: programId, appTag: INTERCOMSWAP_APP_TAG });
+
+      const unsigned = createUnsignedEnvelope({
+        v: 1,
+        kind: KIND.SVC_ANNOUNCE,
+        tradeId,
+        body: {
+          name,
+          pairs: [PAIR.BTC_LN__USDT_SOL],
+          rfq_channels: rfqChannels,
+          app_tag: INTERCOMSWAP_APP_TAG,
+          app_hash: appHash,
+          solana_program_id: programId,
+          offers: maxOffers.map((o) => ({
+            ...o,
+            app_tag: INTERCOMSWAP_APP_TAG,
+            app_hash: appHash,
+            solana_program_id: programId,
+          })),
+          valid_until_unix: validUntil,
+        },
+      });
+      const svcAnnounceId = hashUnsignedEnvelope(unsigned);
+
+      if (dryRun) return { type: 'dry_run', tool: toolName, channels, rfq_channels: rfqChannels, svc_announce_id: svcAnnounceId, unsigned };
+
+      const signing = await this._requirePeerSigning();
+      return withScBridge(this.scBridge, async (sc) => {
+        for (const ch of channels) {
+          const res = await sc.join(ch, {});
+          if (res.type === 'error') throw new Error(`${toolName}: join ${ch} failed: ${res.error}`);
+        }
+        const signed = signSwapEnvelope(unsigned, signing);
+        for (const ch of channels) {
+          await this._sendEnvelopeLogged(sc, ch, signed);
+        }
+        return { type: 'offer_posted', channels, rfq_channels: rfqChannels, svc_announce_id: svcAnnounceId, envelope: signed };
+      });
+    }
     if (toolName === 'intercomswap_rfq_post') {
       assertAllowedKeys(args, toolName, [
         'channel',

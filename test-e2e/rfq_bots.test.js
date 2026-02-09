@@ -519,6 +519,249 @@ test('e2e: RFQ maker/taker bots negotiate and join swap channel (sidechannel inv
   takerSc2.close();
 });
 
+test('e2e: taker listens to maker Offers (svc_announce) and posts RFQ (Offer -> RFQ -> invite)', async (t) => {
+  const runId = crypto.randomBytes(4).toString('hex');
+  const rfqChannel = `btc-usdt-sol-rfq-offer-${runId}`;
+
+  // Local DHT bootstrapper for reliability (avoid public bootstrap nodes).
+  const dhtPort = 30000 + crypto.randomInt(0, 10000);
+  const dht = DHT.bootstrapper(dhtPort, '127.0.0.1');
+  await dht.ready();
+  const dhtBootstrap = `127.0.0.1:${dhtPort}`;
+  t.after(async () => {
+    try {
+      await dht.destroy({ force: true });
+    } catch (_e) {}
+  });
+
+  const storesDir = path.join(repoRoot, 'stores');
+  const makerStore = `e2e-offer-maker-${runId}`;
+  const takerStore = `e2e-offer-taker-${runId}`;
+
+  const makerKeys = await writePeerKeypair({ storesDir, storeName: makerStore });
+  const takerKeys = await writePeerKeypair({ storesDir, storeName: takerStore });
+
+  const makerToken = `token-maker-offer-${runId}`;
+  const takerToken = `token-taker-offer-${runId}`;
+  const [makerPort, takerPort] = await pickFreePorts(2);
+
+  const makerPeer = spawnPeer(
+    [
+      '--peer-store-name',
+      makerStore,
+      '--subnet-channel',
+      `e2e-offer-subnet-${runId}`,
+      '--msb',
+      '0',
+      '--price-oracle',
+      '1',
+      '--price-providers',
+      'static',
+      '--price-static-btc-usdt',
+      '200000',
+      '--price-static-usdt-usd',
+      '1',
+      '--price-static-count',
+      '5',
+      '--price-poll-ms',
+      '200',
+      '--dht-bootstrap',
+      dhtBootstrap,
+      '--sc-bridge',
+      '1',
+      '--sc-bridge-token',
+      makerToken,
+      '--sc-bridge-port',
+      String(makerPort),
+      '--sidechannel-pow',
+      '0',
+      '--sidechannel-welcome-required',
+      '0',
+    ],
+    { label: 'maker-offer' }
+  );
+
+  const takerPeer = spawnPeer(
+    [
+      '--peer-store-name',
+      takerStore,
+      '--subnet-channel',
+      `e2e-offer-subnet-${runId}`,
+      '--msb',
+      '0',
+      '--price-oracle',
+      '1',
+      '--price-providers',
+      'static',
+      '--price-static-btc-usdt',
+      '200000',
+      '--price-static-usdt-usd',
+      '1',
+      '--price-static-count',
+      '5',
+      '--price-poll-ms',
+      '200',
+      '--dht-bootstrap',
+      dhtBootstrap,
+      '--sc-bridge',
+      '1',
+      '--sc-bridge-token',
+      takerToken,
+      '--sc-bridge-port',
+      String(takerPort),
+      '--sidechannel-pow',
+      '0',
+      '--sidechannel-welcome-required',
+      '0',
+    ],
+    { label: 'taker-offer' }
+  );
+
+  t.after(async () => {
+    await killProc(makerPeer.proc);
+    await killProc(takerPeer.proc);
+  });
+
+  const makerSc = new ScBridgeClient({ url: `ws://127.0.0.1:${makerPort}`, token: makerToken });
+  const takerSc = new ScBridgeClient({ url: `ws://127.0.0.1:${takerPort}`, token: takerToken });
+  await connectBridge(makerSc, 'maker sc-bridge');
+  await connectBridge(takerSc, 'taker sc-bridge');
+
+  await retry(async () => {
+    const s = await makerSc.stats();
+    if (s.type !== 'stats' || s.sidechannelStarted !== true) throw new Error('maker sidechannel not started');
+  }, { label: 'maker sidechannel started', tries: 400, delayMs: 250 });
+  await retry(async () => {
+    const s = await takerSc.stats();
+    if (s.type !== 'stats' || s.sidechannelStarted !== true) throw new Error('taker sidechannel not started');
+  }, { label: 'taker sidechannel started', tries: 400, delayMs: 250 });
+
+  // Ensure both peers can exchange messages in the rendezvous before bots start.
+  ensureOk(await makerSc.join(rfqChannel), `join ${rfqChannel} (maker)`);
+  ensureOk(await takerSc.join(rfqChannel), `join ${rfqChannel} (taker)`);
+  ensureOk(await makerSc.subscribe([rfqChannel]), `subscribe ${rfqChannel} (maker)`);
+  ensureOk(await takerSc.subscribe([rfqChannel]), `subscribe ${rfqChannel} (taker)`);
+
+  // Start bots.
+  const makerBot = spawnBot(
+    [
+      'scripts/rfq-maker.mjs',
+      '--url',
+      `ws://127.0.0.1:${makerPort}`,
+      '--token',
+      makerToken,
+      '--peer-keypair',
+      makerKeys.keyPairPath,
+      '--rfq-channel',
+      rfqChannel,
+      '--once',
+      '1',
+    ],
+    { label: 'maker-bot-offer' }
+  );
+
+  const takerBot = spawnBot(
+    [
+      'scripts/rfq-taker.mjs',
+      '--url',
+      `ws://127.0.0.1:${takerPort}`,
+      '--token',
+      takerToken,
+      '--peer-keypair',
+      takerKeys.keyPairPath,
+      '--rfq-channel',
+      rfqChannel,
+      '--listen-offers',
+      '1',
+      '--offer-channel',
+      rfqChannel,
+      '--once',
+      '1',
+      '--timeout-sec',
+      '40',
+    ],
+    { label: 'taker-bot-offer' }
+  );
+
+  t.after(async () => {
+    await killProc(takerBot?.proc);
+    await killProc(makerBot?.proc);
+    try {
+      makerSc.close();
+      takerSc.close();
+    } catch (_e) {}
+  });
+
+  // Broadcast an actionable Offer repeatedly until the taker posts an RFQ (sidechannel is unbuffered).
+  const nowSec = Math.floor(Date.now() / 1000);
+  const offerUnsigned = createUnsignedEnvelope({
+    v: 1,
+    kind: KIND.SVC_ANNOUNCE,
+    tradeId: `svc_offer_${runId}`,
+    body: {
+      name: `maker-offer-${runId}`,
+      pairs: [PAIR.BTC_LN__USDT_SOL],
+      rfq_channels: [rfqChannel],
+      app_hash: APP_HASH,
+      offers: [
+        {
+          pair: PAIR.BTC_LN__USDT_SOL,
+          have: ASSET.USDT_SOL,
+          want: ASSET.BTC_LN,
+          app_hash: APP_HASH,
+          btc_sats: 50000,
+          usdt_amount: '100000000',
+          max_platform_fee_bps: 500,
+          max_trade_fee_bps: 1000,
+          max_total_fee_bps: 1500,
+          min_sol_refund_window_sec: 72 * 3600,
+          max_sol_refund_window_sec: 7 * 24 * 3600,
+        },
+      ],
+      valid_until_unix: nowSec + 60,
+    },
+    ts: Date.now(),
+    nonce: `offer-${runId}`,
+  });
+  const offerSigned = signEnvelope(offerUnsigned, makerKeys);
+
+  ensureOk(await makerSc.send(rfqChannel, offerSigned), 'send offer (initial)');
+  let offerStop = false;
+  const offerResender = setInterval(async () => {
+    if (offerStop) return;
+    try {
+      await makerSc.send(rfqChannel, offerSigned);
+    } catch (_e) {}
+  }, 250);
+  t.after(() => clearInterval(offerResender));
+
+  await waitForSidechannel(makerSc, {
+    channel: rfqChannel,
+    pred: (m) => m?.kind === KIND.RFQ,
+    timeoutMs: 20_000,
+    label: 'wait for RFQ response to offer',
+  });
+  offerStop = true;
+  clearInterval(offerResender);
+
+  const [makerRes, takerRes] = await Promise.all([makerBot.wait(), takerBot.wait()]);
+  const makerEvents = parseJsonLines(makerRes.out);
+  const takerEvents = parseJsonLines(takerRes.out);
+
+  assert.ok(
+    takerEvents.find((e) => e?.type === 'offer_matched'),
+    `taker bot did not emit offer_matched. stdout tail:\n${takerRes.out}\nstderr tail:\n${takerRes.err}`
+  );
+  assert.ok(
+    makerEvents.find((e) => e?.type === 'swap_invite_sent'),
+    `maker bot did not emit swap_invite_sent. stdout tail:\n${makerRes.out}\nstderr tail:\n${makerRes.err}`
+  );
+  assert.ok(
+    takerEvents.find((e) => e?.type === 'swap_joined'),
+    `taker bot did not emit swap_joined. stdout tail:\n${takerRes.out}\nstderr tail:\n${takerRes.err}`
+  );
+});
+
 test('e2e: maker rejects quote_accept from non-RFQ signer (prevents quote hijack)', async (t) => {
   const runId = crypto.randomBytes(4).toString('hex');
   const rfqChannel = `btc-usdt-sol-rfq-hijack-${runId}`;

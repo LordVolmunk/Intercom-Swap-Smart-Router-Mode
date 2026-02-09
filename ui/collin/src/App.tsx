@@ -5,7 +5,7 @@ import { promptAdd, promptListBefore, promptListLatest, scAdd, scListBefore, scL
 
 function App() {
   const [activeTab, setActiveTab] = useState<
-    'overview' | 'rendezvous' | 'rfqs' | 'invites' | 'swaps' | 'refunds' | 'wallets' | 'peers' | 'audit' | 'settings'
+    'overview' | 'rendezvous' | 'offers' | 'rfqs' | 'invites' | 'swaps' | 'refunds' | 'wallets' | 'peers' | 'audit' | 'settings'
   >('overview');
 
   const [promptOpen, setPromptOpen] = useState(true);
@@ -113,6 +113,50 @@ function App() {
   const rfqEvents = useMemo(() => {
     return filteredScEvents.filter((e) => String(e.kind || '') === 'swap.rfq');
   }, [filteredScEvents]);
+
+  const offerEvents = useMemo(() => {
+    return filteredScEvents.filter((e) => String(e.kind || '') === 'swap.svc_announce');
+  }, [filteredScEvents]);
+
+  const myOfferPosts = useMemo(() => {
+    // Offer announcements we posted locally (derived from prompt tool results).
+    const out: any[] = [];
+    const seen = new Set<string>();
+    for (const e of promptEvents) {
+      try {
+        if (!e || typeof e !== 'object') continue;
+        if (String(e.type || '') !== 'prompt_event') continue;
+        const evt = (e as any).evt;
+        if (!evt || typeof evt !== 'object') continue;
+        if (String(evt.type || '') !== 'final') continue;
+        const cj = evt.content_json;
+        if (!cj || typeof cj !== 'object') continue;
+        if (String(cj.type || '') !== 'offer_posted') continue;
+        const env = cj.envelope;
+        if (!env || typeof env !== 'object') continue;
+        const id = String(cj.svc_announce_id || '').trim();
+        const key = id || String(env.trade_id || env.tradeId || '') || String(evt.db_id || '') || String(e.ts || '');
+        if (!key) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const chans = Array.isArray(cj.channels) ? cj.channels.map((c: any) => String(c || '').trim()).filter(Boolean) : [];
+        out.push({
+          channel: chans[0] || String(cj.channel || '').trim(),
+          channels: chans,
+          rfq_channels: Array.isArray(cj.rfq_channels) ? cj.rfq_channels : [],
+          trade_id: String(env.trade_id || env.tradeId || '').trim(),
+          ts: typeof env.ts === 'number' ? env.ts : typeof evt.ts === 'number' ? evt.ts : typeof e.ts === 'number' ? e.ts : Date.now(),
+          message: env,
+          kind: String(env.kind || ''),
+          dir: 'out',
+          local: true,
+          svc_announce_id: id || null,
+        });
+      } catch (_e) {}
+    }
+    return out;
+  }, [promptEvents]);
 
   const myRfqPosts = useMemo(() => {
     // RFQs we posted locally (derived from prompt tool results), so operators can see them
@@ -1106,6 +1150,7 @@ function App() {
               onClick={() => setActiveTab('rendezvous')}
               label="Rendezvous"
             />
+            <NavButton active={activeTab === 'offers'} onClick={() => setActiveTab('offers')} label="Offers" badge={offerEvents.length} />
             <NavButton active={activeTab === 'rfqs'} onClick={() => setActiveTab('rfqs')} label="RFQs" badge={rfqEvents.length} />
             <NavButton
               active={activeTab === 'invites'}
@@ -1746,6 +1791,103 @@ function App() {
                   />
                 )}
               />
+            </Panel>
+          </div>
+        ) : null}
+
+        {activeTab === 'offers' ? (
+          <div className="grid2">
+            <Panel title="Offer Inbox">
+              <p className="muted">
+                Offers are non-binding announcements (swap.svc_announce) that mirror RFQ fields, so BTC sellers can post matching RFQs with minimal back-and-forth.
+              </p>
+              <VirtualList
+                items={offerEvents}
+                itemKey={(e) => String(e.db_id || e.seq || e.ts || Math.random())}
+                estimatePx={100}
+                render={(e) => (
+                  <OfferRow
+                    evt={e}
+                    onSelect={() => setSelected({ type: 'offer', evt: e })}
+                    onRespond={() => {
+                      const body = e?.message?.body || {};
+                      const offers = Array.isArray(body?.offers) ? body.offers : [];
+                      const o = offers[0] && typeof offers[0] === 'object' ? offers[0] : {};
+                      const rfqChan = Array.isArray(body?.rfq_channels) && body.rfq_channels[0] ? String(body.rfq_channels[0]) : (scChannels.split(',')[0]?.trim() || '0000intercomswapbtcusdt');
+                      setRunMode('tool');
+                      setToolName('intercomswap_rfq_post');
+                      setToolArgsBoth({
+                        channel: rfqChan,
+                        trade_id: `rfq-${Date.now()}`,
+                        btc_sats: typeof o?.btc_sats === 'number' ? o.btc_sats : 10000,
+                        usdt_amount: typeof o?.usdt_amount === 'string' ? o.usdt_amount : '1000000',
+                        max_platform_fee_bps: typeof o?.max_platform_fee_bps === 'number' ? o.max_platform_fee_bps : 500,
+                        max_trade_fee_bps: typeof o?.max_trade_fee_bps === 'number' ? o.max_trade_fee_bps : 1000,
+                        max_total_fee_bps: typeof o?.max_total_fee_bps === 'number' ? o.max_total_fee_bps : 1500,
+                        min_sol_refund_window_sec: typeof o?.min_sol_refund_window_sec === 'number' ? o.min_sol_refund_window_sec : 72 * 3600,
+                        max_sol_refund_window_sec: typeof o?.max_sol_refund_window_sec === 'number' ? o.max_sol_refund_window_sec : 7 * 24 * 3600,
+                        valid_until_unix: Math.floor(Date.now() / 1000) + 600,
+                      });
+                      setPromptOpen(true);
+                    }}
+                  />
+                )}
+              />
+            </Panel>
+            <Panel title="My Offers (Posted Locally)">
+              <p className="muted small">
+                These offers were posted from this browser session (derived from prompt history). They may not appear in the inbox if no peers are connected.
+              </p>
+              <VirtualList
+                items={myOfferPosts}
+                itemKey={(e) => String(e.svc_announce_id || e.trade_id || e.ts || Math.random())}
+                estimatePx={100}
+                render={(e) => (
+                  <OfferRow
+                    evt={e}
+                    onSelect={() => setSelected({ type: 'offer_posted', evt: e })}
+                    onRespond={() => {}}
+                    showRespond={false}
+                    badge="outbox"
+                  />
+                )}
+              />
+            </Panel>
+            <Panel title="Prompt Console Shortcuts">
+              <button
+                className="btn primary"
+                onClick={() => {
+                  const chans = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
+                  setRunMode('tool');
+                  setToolName('intercomswap_offer_post');
+                  setToolArgsBoth({
+                    channels: chans.length > 0 ? chans : ['0000intercomswapbtcusdt'],
+                    name: 'maker:offer',
+                    rfq_channels: chans.length > 0 ? chans : ['0000intercomswapbtcusdt'],
+                    ttl_sec: 300,
+                    offers: [
+                      {
+                        pair: 'BTC_LN/USDT_SOL',
+                        have: 'USDT_SOL',
+                        want: 'BTC_LN',
+                        btc_sats: 10000,
+                        usdt_amount: '1000000',
+                        max_platform_fee_bps: 500,
+                        max_trade_fee_bps: 1000,
+                        max_total_fee_bps: 1500,
+                        min_sol_refund_window_sec: 72 * 3600,
+                        max_sol_refund_window_sec: 7 * 24 * 3600,
+                      },
+                    ],
+                  });
+                  setPromptOpen(true);
+                }}
+              >
+                New Offer tool-call (buy BTC)
+              </button>
+              <p className="muted small">
+                Sellers can respond by posting an RFQ using the “Respond” button in the Offer inbox.
+              </p>
             </Panel>
           </div>
         ) : null}
@@ -2636,6 +2778,7 @@ function toolGroup(name: string) {
   if (n.startsWith('intercomswap_sc_')) return 'SC-Bridge';
   if (n.startsWith('intercomswap_peer_')) return 'Peers';
   if (n.startsWith('intercomswap_rfqbot_')) return 'RFQ Bots';
+  if (n.startsWith('intercomswap_offer_')) return 'RFQ Protocol';
   if (n.startsWith('intercomswap_rfq_') || n.startsWith('intercomswap_quote_') || n.startsWith('intercomswap_terms_')) return 'RFQ Protocol';
   if (n.startsWith('intercomswap_swap_')) return 'Swap Helpers';
   if (n.startsWith('intercomswap_ln_')) return 'Lightning';
@@ -3457,6 +3600,90 @@ function RfqRow({
             }}
           >
             Quote
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function OfferRow({
+  evt,
+  onSelect,
+  onRespond,
+  showRespond = true,
+  badge = '',
+}: {
+  evt: any;
+  onSelect: () => void;
+  onRespond: () => void;
+  showRespond?: boolean;
+  badge?: string;
+}) {
+  const body = evt?.message?.body;
+  const name = typeof body?.name === 'string' ? body.name : '';
+  const offers = Array.isArray(body?.offers) ? body.offers : [];
+  const o = offers[0] && typeof offers[0] === 'object' ? offers[0] : {};
+
+  const have = typeof o?.have === 'string' ? o.have : '';
+  const want = typeof o?.want === 'string' ? o.want : '';
+  const btcSats = typeof o?.btc_sats === 'number' ? o.btc_sats : null;
+  const usdtAtomic = typeof o?.usdt_amount === 'string' ? o.usdt_amount : '';
+  const maxPlatform = o?.max_platform_fee_bps;
+  const maxTrade = o?.max_trade_fee_bps;
+  const maxTotal = o?.max_total_fee_bps;
+  const minWin = o?.min_sol_refund_window_sec;
+  const maxWin = o?.max_sol_refund_window_sec;
+  const validUntil = body?.valid_until_unix;
+  const rfqChans = Array.isArray(body?.rfq_channels) ? body.rfq_channels.map((c: any) => String(c || '').trim()).filter(Boolean) : [];
+
+  const hint =
+    have === 'USDT_SOL' && want === 'BTC_LN'
+      ? 'have USDT (Solana), want BTC (Lightning)'
+      : have || want
+        ? 'offer'
+        : '';
+
+  return (
+    <div className="rowitem" role="button" onClick={onSelect}>
+      <div className="rowitem-top">
+        <span className="mono chip">{evt.channel}</span>
+        {badge ? <span className="mono chip hi">{badge}</span> : null}
+        {name ? <span className="mono dim">{name}</span> : null}
+        <span className="mono dim">{evt.trade_id || evt?.message?.trade_id || ''}</span>
+      </div>
+      <div className="rowitem-mid">
+        <span className="mono">
+          {hint ? `offer: ${hint}` : 'offer'}
+          {offers.length > 1 ? ` (${offers.length} offers)` : ''}
+        </span>
+        <span className="mono">BTC: {btcSats !== null ? `${satsToBtcDisplay(btcSats)} (${btcSats} sats)` : '?'}</span>
+        <span className="mono">USDT: {usdtAtomic ? `${atomicToDecimal(usdtAtomic, 6)} (${usdtAtomic})` : '?'}</span>
+        <span className="mono">
+          fee caps:{' '}
+          {typeof maxPlatform === 'number' ? `${maxPlatform} bps (${bpsToPctDisplay(maxPlatform)}%)` : '?'} platform,{' '}
+          {typeof maxTrade === 'number' ? `${maxTrade} bps (${bpsToPctDisplay(maxTrade)}%)` : '?'} trade,{' '}
+          {typeof maxTotal === 'number' ? `${maxTotal} bps (${bpsToPctDisplay(maxTotal)}%)` : '?'} total
+        </span>
+        <span className="mono">
+          sol window: {typeof minWin === 'number' ? `${secToHuman(minWin)} (${minWin}s)` : '?'}-
+          {typeof maxWin === 'number' ? `${secToHuman(maxWin)} (${maxWin}s)` : '?'}
+        </span>
+        <span className="mono">
+          rfq_channels: {rfqChans.length > 0 ? rfqChans.join(', ') : '?'}
+        </span>
+        <span className="mono">valid_until: {validUntil ?? '?'}</span>
+      </div>
+      <div className="rowitem-bot">
+        {showRespond ? (
+          <button
+            className="btn small primary"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRespond();
+            }}
+          >
+            Respond (post RFQ)
           </button>
         ) : null}
       </div>
