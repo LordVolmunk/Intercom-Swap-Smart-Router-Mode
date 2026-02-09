@@ -621,10 +621,13 @@ export class ToolExecutor {
       else if (lnClass.is_test !== null || solClass.is_test !== null) envKind = 'mixed';
 
       const receiptsDb = String(this.receipts?.dbPath || '').trim() || '';
+      const peerKeypair = String(this.peer?.keypairPath || '').trim() || '';
+      const peerKeypairExists = peerKeypair ? fs.existsSync(peerKeypair) : false;
 
       return {
         type: 'env',
         env_kind: envKind,
+        peer: { keypair: peerKeypair || null, exists: peerKeypair ? peerKeypairExists : null },
         ln: { impl: lnImpl, backend: lnBackend, network: lnNetwork || null, classify: lnClass },
         solana: {
           rpc_urls: solRpcUrls,
@@ -1306,7 +1309,7 @@ export class ToolExecutor {
       }
 
       const { peerStart } = await import('../peer/peerManager.js');
-      return peerStart({
+      const out = await peerStart({
         repoRoot: process.cwd(),
         name,
         store,
@@ -1326,6 +1329,20 @@ export class ToolExecutor {
         logPath,
         readyTimeoutMs,
       });
+
+      // UX: if promptd wasn't configured with a peer signing keypair path, infer it from the store.
+      // This lets operators post signed RFQs immediately after starting a peer via Collin.
+      try {
+        const inferred = path.join(process.cwd(), 'stores', store, 'db', 'keypair.json');
+        if (!this.peer) this.peer = { keypairPath: inferred };
+        if (!String(this.peer.keypairPath || '').trim()) this.peer.keypairPath = inferred;
+        this._peerSigning = null;
+        if (out && typeof out === 'object') {
+          out.peer_keypair = { inferred: true, path: inferred };
+        }
+      } catch (_e) {}
+
+      return out;
     }
 
     if (toolName === 'intercomswap_peer_stop') {

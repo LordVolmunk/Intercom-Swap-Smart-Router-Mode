@@ -94,6 +94,12 @@ function App() {
     scFollowTailRef.current = scFollowTail;
   }, [scFollowTail]);
 
+  const promptFollowTailRef = useRef(true);
+  const [promptFollowTail, setPromptFollowTail] = useState(true);
+  useEffect(() => {
+    promptFollowTailRef.current = promptFollowTail;
+  }, [promptFollowTail]);
+
   const filteredScEvents = useMemo(() => {
     const chan = scFilter.channel.trim();
     const kind = scFilter.kind.trim();
@@ -285,6 +291,84 @@ function App() {
       }
     }
     return out;
+  }
+
+	  function validateToolArgs(tool: any, args: any): string[] {
+	    if (!tool) return ['Tools not loaded (click Reload tools).'];
+	    if (!args || typeof args !== 'object') return ['Arguments must be an object.'];
+	    const params = tool?.parameters;
+	    const props: Record<string, any> =
+	      params?.properties && typeof params.properties === 'object' ? (params.properties as any) : {};
+	    const reqList: string[] = Array.isArray(params?.required) ? params.required.map((v: any) => String(v)) : [];
+	    const req = new Set<string>(reqList);
+	    const errs: string[] = [];
+
+    for (const k of req) {
+      const v = (args as any)[k];
+      const sch = (props as any)[k] || {};
+      if (v === undefined || v === null) {
+        errs.push(`${k}: required`);
+        continue;
+      }
+      if (typeof v === 'string' && !v.trim()) {
+        errs.push(`${k}: required`);
+        continue;
+      }
+      if (Array.isArray(v) && typeof sch?.minItems === 'number' && v.length < sch.minItems) {
+        errs.push(`${k}: must have at least ${sch.minItems} item(s)`);
+        continue;
+      }
+    }
+
+    for (const [k, v] of Object.entries(args || {})) {
+      const sch: any = (props as any)[k];
+      if (!sch || typeof sch !== 'object') continue;
+      if (Array.isArray(sch.anyOf)) continue; // too complex; server validates
+
+      const t = sch.type;
+      if (Array.isArray(sch.enum) && sch.enum.length > 0) {
+        const ok = sch.enum.some((ev: any) => String(ev) === String(v));
+        if (!ok) errs.push(`${k}: must be one of ${sch.enum.map((x: any) => JSON.stringify(x)).join(', ')}`);
+      }
+
+      if (t === 'string') {
+        if (typeof v !== 'string') {
+          errs.push(`${k}: must be a string`);
+          continue;
+        }
+        const s = v.trim();
+        if (typeof sch.minLength === 'number' && s.length < sch.minLength) errs.push(`${k}: too short (min ${sch.minLength})`);
+        if (typeof sch.maxLength === 'number' && s.length > sch.maxLength) errs.push(`${k}: too long (max ${sch.maxLength})`);
+        if (typeof sch.pattern === 'string') {
+          try {
+            const re = new RegExp(sch.pattern);
+            if (!re.test(s)) errs.push(`${k}: invalid format`);
+          } catch (_e) {
+            // ignore invalid regex from schema
+          }
+        }
+      } else if (t === 'integer') {
+        if (typeof v !== 'number' || !Number.isInteger(v)) {
+          errs.push(`${k}: must be an integer`);
+          continue;
+        }
+        if (typeof sch.minimum === 'number' && v < sch.minimum) errs.push(`${k}: must be >= ${sch.minimum}`);
+        if (typeof sch.maximum === 'number' && v > sch.maximum) errs.push(`${k}: must be <= ${sch.maximum}`);
+      } else if (t === 'boolean') {
+        if (typeof v !== 'boolean') errs.push(`${k}: must be true/false`);
+      } else if (t === 'array') {
+        if (!Array.isArray(v)) {
+          errs.push(`${k}: must be an array`);
+          continue;
+        }
+        if (typeof sch.minItems === 'number' && v.length < sch.minItems) errs.push(`${k}: must have >= ${sch.minItems} item(s)`);
+        if (typeof sch.maxItems === 'number' && v.length > sch.maxItems) errs.push(`${k}: must have <= ${sch.maxItems} item(s)`);
+      } else if (t === 'object') {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) errs.push(`${k}: must be an object`);
+      }
+    }
+
+    return errs;
   }
 
   async function refreshHealth() {
@@ -521,17 +605,18 @@ function App() {
 
   async function appendPromptEvent(evt: any, { persist = true } = {}) {
     const e = evt && typeof evt === 'object' ? evt : { type: 'event', evt };
-    const ts = typeof e.ts === 'number' ? e.ts : Date.now();
+    const ts = typeof e.ts === 'number' ? e.ts : typeof e.started_at === 'number' ? e.started_at : Date.now();
+    const normalized = { ...e, ts };
     const sid = String(e.session_id || sessionId || '');
     const type = String(e.type || 'event');
     let dbId: number | null = null;
     if (persist) {
       try {
-        dbId = await promptAdd({ ts, session_id: sid, type, evt: e });
+        dbId = await promptAdd({ ts, session_id: sid, type, evt: normalized });
       } catch (_e) {}
     }
     setPromptEvents((prev) => {
-      const next = prev.concat([{ ...e, db_id: dbId }]);
+      const next = prev.concat([{ ...normalized, db_id: dbId }]);
       if (next.length <= promptEventsMax) return next;
       return next.slice(next.length - promptEventsMax);
     });
@@ -539,19 +624,21 @@ function App() {
 
   async function appendScEvent(evt: any, { persist = true } = {}) {
     const e = evt && typeof evt === 'object' ? evt : { type: 'event', evt };
-    const ts = typeof e.ts === 'number' ? e.ts : Date.now();
+    const msgTs = e?.message && typeof e.message.ts === 'number' ? e.message.ts : null;
+    const ts = typeof e.ts === 'number' ? e.ts : msgTs !== null ? msgTs : Date.now();
+    const normalized = { ...e, ts };
     const channel = String(e.channel || '');
     const kind = String(e.kind || '');
     const trade_id = String(e.trade_id || '');
     const seq = typeof e.seq === 'number' ? e.seq : null;
     let dbId: number | null = null;
-    if (persist && e.type === 'sc_event') {
+    if (persist && normalized.type === 'sc_event') {
       try {
-        dbId = await scAdd({ ts, channel, kind, trade_id, seq, evt: e });
+        dbId = await scAdd({ ts, channel, kind, trade_id, seq, evt: normalized });
       } catch (_e) {}
     }
     setScEvents((prev) => {
-      const next = prev.concat([{ ...e, db_id: dbId }]);
+      const next = prev.concat([{ ...normalized, db_id: dbId }]);
       if (next.length <= scEventsMax) return next;
       return next.slice(next.length - scEventsMax);
     });
@@ -564,15 +651,17 @@ function App() {
     return { kind, trade_id };
   }
 
-  async function startScStream() {
-    if (scAbortRef.current) scAbortRef.current.abort();
-    const ac = new AbortController();
-    scAbortRef.current = ac;
+	async function startScStream() {
+		if (scAbortRef.current) scAbortRef.current.abort();
+		const ac = new AbortController();
+		scAbortRef.current = ac;
+		let sawOpen = false;
+		let hadError = false;
 
-    const channels = scChannels
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
+		const channels = scChannels
+			.split(',')
+			.map((s) => s.trim())
+			.filter(Boolean)
       .slice(0, 50);
     const url = new URL('/v1/sc/stream', window.location.origin);
     if (channels.length > 0) url.searchParams.set('channels', channels.join(','));
@@ -582,50 +671,60 @@ function App() {
     setScStreamErr(null);
     await appendScEvent({ type: 'ui', ts: Date.now(), message: `sc/stream connecting (${channels.length || 'all'})...` }, { persist: false });
 
-    try {
-      const res = await fetch(url.toString(), { method: 'GET', signal: ac.signal });
-      if (!res.ok || !res.body) throw new Error(`sc/stream failed: ${res.status}`);
-      const reader = res.body.getReader();
-      const td = new TextDecoder();
-      let buf = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += td.decode(value, { stream: true });
-        while (true) {
-          const idx = buf.indexOf('\n');
-          if (idx < 0) break;
-          const line = buf.slice(0, idx).trim();
-          buf = buf.slice(idx + 1);
-          if (!line) continue;
-          let obj: any = null;
-          try {
-            obj = JSON.parse(line);
-          } catch (_e) {
-            await appendScEvent({ type: 'parse_error', ts: Date.now(), line }, { persist: false });
-            continue;
-          }
-          if (obj.type === 'sc_event') {
-            const msg = obj.message;
-            const d = deriveKindTrade(msg);
-            await appendScEvent({ ...obj, ...d }, { persist: true });
-          } else if (obj.type === 'error') {
-            const errMsg = String(obj?.error || 'sc/stream error');
-            setScStreamErr(errMsg);
-            await appendScEvent(obj, { persist: false });
-          } else {
-            await appendScEvent(obj, { persist: false });
-          }
-        }
-      }
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      setScStreamErr(msg);
-      await appendScEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
-    } finally {
-      setScConnected(false);
-    }
-  }
+		try {
+			const res = await fetch(url.toString(), { method: 'GET', signal: ac.signal });
+			if (!res.ok || !res.body) throw new Error(`sc/stream failed: ${res.status}`);
+			const reader = res.body.getReader();
+			const td = new TextDecoder();
+			let buf = '';
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buf += td.decode(value, { stream: true });
+				while (true) {
+					const idx = buf.indexOf('\n');
+					if (idx < 0) break;
+					const line = buf.slice(0, idx).trim();
+					buf = buf.slice(idx + 1);
+					if (!line) continue;
+					let obj: any = null;
+					try {
+						obj = JSON.parse(line);
+					} catch (_e) {
+						await appendScEvent({ type: 'parse_error', ts: Date.now(), line }, { persist: false });
+						continue;
+					}
+					if (obj.type === 'sc_stream_open') sawOpen = true;
+					if (obj.type === 'sc_event') {
+						const msg = obj.message;
+						const d = deriveKindTrade(msg);
+						await appendScEvent({ ...obj, ...d }, { persist: true });
+					} else if (obj.type === 'error') {
+						const errMsg = String(obj?.error || 'sc/stream error');
+						hadError = true;
+						setScStreamErr(errMsg);
+						await appendScEvent(obj, { persist: false });
+					} else {
+						await appendScEvent(obj, { persist: false });
+					}
+				}
+			}
+		} catch (err: any) {
+			hadError = true;
+			const msg = err?.message || String(err);
+			setScStreamErr(msg);
+			await appendScEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
+		} finally {
+			// If the stream ends without an explicit error (eg, peer not running / SC-Bridge unreachable),
+			// surface that as a visible error so operators aren’t left guessing.
+			if (!ac.signal.aborted && !hadError && !sawOpen) {
+				const msg = 'sc/stream ended before open (peer/SC-Bridge not ready?)';
+				setScStreamErr(msg);
+				await appendScEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
+			}
+			setScConnected(false);
+		}
+	}
 
   function stopScStream() {
     if (scAbortRef.current) scAbortRef.current.abort();
@@ -707,6 +806,12 @@ function App() {
     if (runMode === 'tool') {
       const name = toolName.trim();
       if (!name) return;
+      if (!activeTool || activeTool?.name !== name) {
+        const msg = 'Tools not loaded yet. Click "Reload tools".';
+        setRunErr(msg);
+        void appendPromptEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
+        return;
+      }
       let args: any = {};
       if (toolInputMode === 'form') {
         args = toolArgsObj && typeof toolArgsObj === 'object' ? toolArgsObj : {};
@@ -722,6 +827,14 @@ function App() {
           void appendPromptEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
           return;
         }
+      }
+
+      const argErrs = validateToolArgs(activeTool, args);
+      if (argErrs.length > 0) {
+        const msg = `Invalid args:\n- ${argErrs.join('\n- ')}`;
+        setRunErr(msg);
+        void appendPromptEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
+        return;
       }
 
       if (toolRequiresApproval(name) && !autoApprove) {
@@ -800,6 +913,13 @@ function App() {
   }, [scEvents, scFollowTail]);
 
   useEffect(() => {
+    if (!promptFollowTail) return;
+    const el = promptListRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [promptEvents, promptFollowTail]);
+
+  useEffect(() => {
     if (!consoleFollowTail) return;
     const el = consoleListRef.current;
     if (!el) return;
@@ -817,6 +937,8 @@ function App() {
   const onPromptScroll = () => {
     const cur = promptListRef.current;
     if (!cur) return;
+    const atBottom = cur.scrollHeight - cur.scrollTop - cur.clientHeight < 120;
+    if (!atBottom && promptFollowTailRef.current) setPromptFollowTail(false);
     if (cur.scrollTop < 140) void loadOlderPromptEvents({ limit: 250 });
   };
 
@@ -928,15 +1050,19 @@ function App() {
       <main className="main">
         {activeTab === 'overview' ? (
           <div className="grid2">
-            <Panel title="Getting Started">
-              <p className="muted">
-                Linear checklist for running swaps. If something is missing, use the buttons to prepare tool calls (and
-                run them from the console).
-              </p>
-              <div className="row">
-                <button className="btn primary" onClick={refreshPreflight} disabled={preflightBusy}>
-                  {preflightBusy ? 'Checking…' : 'Refresh checklist'}
-                </button>
+				<Panel title="Getting Started">
+					<p className="muted">
+						Linear checklist for posting RFQs and running swaps. Use the buttons to prepare tool calls (and run them
+						from the console).
+					</p>
+					<div className="alert">
+						To <b>post an RFQ</b>, you only need steps <span className="mono">1-3</span>. Lightning and Solana are
+						required only to <b>settle</b> swaps.
+					</div>
+					<div className="row">
+						<button className="btn primary" onClick={refreshPreflight} disabled={preflightBusy}>
+							{preflightBusy ? 'Checking…' : 'Refresh checklist'}
+						</button>
                 {preflight?.ts ? <span className="muted small">last: {new Date(preflight.ts).toLocaleTimeString()}</span> : null}
               </div>
 
@@ -966,6 +1092,11 @@ function App() {
                   receipts.db: <span className="mono">{String(envInfo?.receipts?.db || '—')}</span>
                 </div>
                 <div className="muted small">
+                  peer.keypair:{' '}
+                  <span className="mono">{String(envInfo?.peer?.keypair || '—')}</span>{' '}
+                  {envInfo?.peer?.exists === false ? <span className="chip warn">missing</span> : null}
+                </div>
+                <div className="muted small">
                   Tip: keep test and mainnet as separate instances (different promptd ports + different receipts DB paths).
                 </div>
                 {envErr ? <div className="alert bad">{String(envErr)}</div> : null}
@@ -976,9 +1107,9 @@ function App() {
                 </div>
               </div>
 
-              <div className="field">
-                <div className="field-hd">
-                  <span className="mono">1) Peer + SC-Bridge</span>
+						<div className="field">
+							<div className="field-hd">
+								<span className="mono">1) Peer + SC-Bridge</span>
                   {preflight?.peer_status?.peers?.some?.((p: any) => p?.alive) ? (
                     <span className="chip hi">running</span>
                   ) : (
@@ -993,6 +1124,8 @@ function App() {
                   <button
                     className="btn"
                     onClick={() => {
+                      setToolInputMode('form');
+                      setToolArgsParseErr(null);
                       setRunMode('tool');
                       setToolName('intercomswap_peer_start');
                       setToolArgsBoth({
@@ -1012,6 +1145,43 @@ function App() {
                     Prepare peer_start (swap-maker)
                   </button>
                   <button
+                    className="btn primary"
+                    disabled={runBusy}
+                    onClick={async () => {
+                      const args = {
+                        name: 'swap-maker-peer',
+                        store: 'swap-maker',
+                        sc_port: 49222,
+                        sidechannels: scChannels.split(',').map((s) => s.trim()).filter(Boolean),
+                        pow_enabled: true,
+                        pow_difficulty: 12,
+                        invite_required: true,
+                        welcome_required: false,
+                        invite_prefixes: ['swap:'],
+                      };
+                      setToolInputMode('form');
+                      setToolArgsParseErr(null);
+                      setRunMode('tool');
+                      setToolName('intercomswap_peer_start');
+                      setToolArgsBoth(args);
+                      setPromptOpen(true);
+                      const ok =
+                        autoApprove ||
+                        window.confirm(
+                          `Start swap-maker peer now?\n\nThis will spawn a detached pear process using store "swap-maker" and SC-Bridge port 49222.`
+                        );
+                      if (!ok) return;
+                      await runPromptStream({
+                        prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_peer_start', arguments: args }),
+                        session_id: sessionId,
+                        auto_approve: true,
+                        dry_run: false,
+                      });
+                    }}
+                  >
+                    Start peer now
+                  </button>
+                  <button
                     className="btn"
                     onClick={() => {
                       setRunMode('tool');
@@ -1023,18 +1193,19 @@ function App() {
                     peer_status
                   </button>
                 </div>
-              </div>
+						</div>
 
-              <div className="field">
-                <div className="field-hd">
-                  <span className="mono">2) Sidechannel stream</span>
-                  {scConnected ? <span className="chip hi">connected</span> : <span className="chip">disconnected</span>}
-                </div>
-                {preflight?.sc_info_error ? <div className="alert bad">{String(preflight.sc_info_error)}</div> : null}
-                <div className="row">
-                  {!scConnected ? (
-                    <button className="btn primary" onClick={startScStream}>
-                      Connect sc/stream
+						<div className="field">
+							<div className="field-hd">
+								<span className="mono">2) Sidechannel stream (recommended)</span>
+								{scConnected ? <span className="chip hi">connected</span> : <span className="chip">disconnected</span>}
+							</div>
+							{scStreamErr ? <div className="alert bad">{String(scStreamErr)}</div> : null}
+							{preflight?.sc_info_error ? <div className="alert bad">{String(preflight.sc_info_error)}</div> : null}
+							<div className="row">
+								{!scConnected ? (
+									<button className="btn primary" onClick={startScStream}>
+										Connect sc/stream
                     </button>
                   ) : (
                     <button className="btn" onClick={stopScStream}>
@@ -1055,16 +1226,96 @@ function App() {
                     Prepare subscribe
                   </button>
                 </div>
-              </div>
+						</div>
 
-              <div className="field">
-                <div className="field-hd">
-                  <span className="mono">3) Lightning readiness</span>
-                  {preflight?.ln_summary?.channels > 0 ? (
-                    <span className="chip hi">{preflight.ln_summary.channels} channel(s)</span>
-                  ) : (
-                    <span className="chip">no channels</span>
-                  )}
+						<div className="field">
+							<div className="field-hd">
+								<span className="mono">3) Post an RFQ (request)</span>
+								<span className="chip">tool: rfq_post</span>
+							</div>
+							<div className="muted small">
+								This posts a <b>signed</b> RFQ envelope into the rendezvous channel.
+							</div>
+							<div className="row">
+								<button
+									className="btn"
+									onClick={() => {
+										const chans = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
+										const rendezvous = chans[0] || '0000intercomswapbtcusdt';
+										const now = Date.now();
+										setToolInputMode('form');
+										setToolArgsParseErr(null);
+										setRunMode('tool');
+										setToolName('intercomswap_rfq_post');
+										setToolArgsBoth({
+											channel: rendezvous,
+											trade_id: `rfq-${now}`,
+											btc_sats: 10_000,
+											usdt_amount: '1000000',
+											max_platform_fee_bps: 50,
+											max_trade_fee_bps: 50,
+											max_total_fee_bps: 100,
+											min_sol_refund_window_sec: 72 * 3600,
+											max_sol_refund_window_sec: 7 * 24 * 3600,
+											valid_until_unix: Math.floor(now / 1000) + 10 * 60,
+										});
+										setPromptOpen(true);
+									}}
+								>
+									Prepare rfq_post
+								</button>
+								<button
+									className="btn primary"
+									disabled={runBusy}
+									onClick={async () => {
+										const chans = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
+										const rendezvous = chans[0] || '0000intercomswapbtcusdt';
+										const now = Date.now();
+										const args = {
+											channel: rendezvous,
+											trade_id: `rfq-${now}`,
+											btc_sats: 10_000,
+											usdt_amount: '1000000',
+											max_platform_fee_bps: 50,
+											max_trade_fee_bps: 50,
+											max_total_fee_bps: 100,
+											min_sol_refund_window_sec: 72 * 3600,
+											max_sol_refund_window_sec: 7 * 24 * 3600,
+											valid_until_unix: Math.floor(now / 1000) + 10 * 60,
+										};
+										setToolInputMode('form');
+										setToolArgsParseErr(null);
+										setRunMode('tool');
+										setToolName('intercomswap_rfq_post');
+										setToolArgsBoth(args);
+										setPromptOpen(true);
+										const ok =
+											autoApprove ||
+											window.confirm(
+												`Post RFQ now?\n\nChannel: ${rendezvous}\nBTC: 0.00010000 (10,000 sats)\nUSDT: 1.0\nMax fees: 0.5% platform + 0.5% trade (1.0% total)`
+										);
+										if (!ok) return;
+										await runPromptStream({
+											prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_rfq_post', arguments: args }),
+											session_id: sessionId,
+											auto_approve: true,
+											dry_run: false,
+										});
+									}}
+								>
+									Post RFQ now
+								</button>
+							</div>
+						</div>
+
+						<div className="field">
+							<div className="field-hd">
+								<span className="mono">4) Lightning readiness (settlement)</span>
+								{preflight?.ln_summary?.channels > 0 ? (
+									<span className="chip hi">{preflight.ln_summary.channels} channel(s)</span>
+								) : (
+									<span className="chip">no channels</span>
+								)}
                 </div>
                 <div className="muted small">
                   Swaps can route over the LN network, but you still need an LN node with funds and typically at least one channel for paying invoices.
@@ -1083,13 +1334,13 @@ function App() {
                     ln_listfunds
                   </button>
                 </div>
-              </div>
+						</div>
 
-              <div className="field">
-                <div className="field-hd">
-                  <span className="mono">4) Solana readiness</span>
-                  {preflight?.sol_signer?.pubkey ? <span className="chip hi">signer ok</span> : <span className="chip">unknown</span>}
-                </div>
+						<div className="field">
+							<div className="field-hd">
+								<span className="mono">5) Solana readiness (settlement)</span>
+								{preflight?.sol_signer?.pubkey ? <span className="chip hi">signer ok</span> : <span className="chip">unknown</span>}
+							</div>
                 {preflight?.sol_signer_error ? <div className="alert bad">{String(preflight.sol_signer_error)}</div> : null}
                 {preflight?.sol_config_error ? <div className="alert bad">{String(preflight.sol_config_error)}</div> : null}
                 <div className="row">
@@ -1696,6 +1947,8 @@ function App() {
                 <button
                   className="btn"
                   onClick={() => {
+                    setToolInputMode('form');
+                    setToolArgsParseErr(null);
                     setRunMode('tool');
                     setToolName('intercomswap_peer_start');
                     setToolArgsBoth({
@@ -1822,7 +2075,16 @@ function App() {
         ) : null}
 
         {activeTab === 'audit' ? (
-          <Panel title="Prompt Events">
+          <Panel title="Prompt History (local)">
+            <div className="row">
+              <label className="check small">
+                <input type="checkbox" checked={promptFollowTail} onChange={(e) => setPromptFollowTail(e.target.checked)} />
+                follow tail
+              </label>
+              <button className="btn" onClick={() => setPromptEvents([])}>
+                Clear (memory only)
+              </button>
+            </div>
             <VirtualList
               items={promptEvents}
               itemKey={(e) => String(e.db_id || '') + ':' + String(e.type || '') + ':' + String(e.ts || '')}
@@ -1830,11 +2092,7 @@ function App() {
               listRef={promptListRef}
               onScroll={onPromptScroll}
               render={(e) => (
-                <EventRow
-                  evt={e}
-                  onSelect={() => setSelected({ type: 'prompt_event', evt: e })}
-                  selected={selected?.type === 'prompt_event' && selected?.evt === e}
-                />
+                <ConsoleEventRow evt={e} onSelect={() => setSelected({ type: 'prompt_event', evt: e })} />
               )}
             />
           </Panel>
