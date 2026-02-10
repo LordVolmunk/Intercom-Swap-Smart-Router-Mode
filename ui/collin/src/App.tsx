@@ -2056,9 +2056,6 @@ function App() {
         {activeTab === 'prompt' ? (
           <div className="grid2">
             <Panel title="Prompt">
-              <div className="alert warn">
-                LLM prompting is optional. Avoid pasting untrusted peer content. Prefer the structured UI (Sell USDT / Sell BTC / Invites / Wallets).
-              </div>
               <textarea
                 className="textarea"
                 value={promptInput}
