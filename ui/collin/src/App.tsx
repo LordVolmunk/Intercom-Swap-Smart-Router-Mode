@@ -57,6 +57,13 @@ function App() {
   const [scStreamErr, setScStreamErr] = useState<string | null>(null);
   const [scChannels, setScChannels] = useState<string>('0000intercomswapbtcusdt');
   const [scFilter, setScFilter] = useState<{ channel: string; kind: string }>({ channel: '', kind: '' });
+  const [showExpiredInvites, setShowExpiredInvites] = useState<boolean>(() => {
+    try {
+      return String(window.localStorage.getItem('collin_show_expired_invites') || '') === '1';
+    } catch (_e) {
+      return false;
+    }
+  });
 
 	  const [selected, setSelected] = useState<any>(null);
 
@@ -182,6 +189,12 @@ function App() {
       if (walletUsdtMint.trim()) window.localStorage.setItem('collin_wallet_usdt_mint', walletUsdtMint.trim());
     } catch (_e) {}
   }, [walletUsdtMint]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('collin_show_expired_invites', showExpiredInvites ? '1' : '0');
+    } catch (_e) {}
+  }, [showExpiredInvites]);
 
   useEffect(() => {
     // Best-effort UX: infer token mint from the most recent receipt, so operators immediately see the right USDT mint.
@@ -602,8 +615,33 @@ function App() {
   }, [promptEvents, scEvents, localPeerPubkeyHex]);
 
   const inviteEvents = useMemo(() => {
-    return filteredScEvents.filter((e) => String(e.kind || '') === 'swap.swap_invite');
-  }, [filteredScEvents]);
+    const now = Date.now();
+    const out: any[] = [];
+    const seen = new Set<string>();
+    for (const e of filteredScEvents) {
+      try {
+        if (String((e as any)?.kind || '') !== 'swap.swap_invite') continue;
+        const msg = (e as any)?.message;
+        const tradeId = String(msg?.trade_id || (e as any)?.trade_id || '').trim();
+        const swapCh = String(msg?.body?.swap_channel || '').trim();
+        const expiresAtRaw = msg?.body?.invite?.payload?.expiresAt;
+        const expiresAtMs =
+          typeof expiresAtRaw === 'number'
+            ? expiresAtRaw
+            : typeof expiresAtRaw === 'string' && /^[0-9]+$/.test(expiresAtRaw.trim())
+              ? Number.parseInt(expiresAtRaw.trim(), 10)
+              : null;
+        const expired = expiresAtMs && Number.isFinite(expiresAtMs) && expiresAtMs > 0 ? now > expiresAtMs : false;
+        if (expired && !showExpiredInvites) continue;
+
+        const key = `${tradeId || ''}|${swapCh || ''}|${String((e as any)?.from || '')}|${String((e as any)?.seq || '')}`;
+        if (key && seen.has(key)) continue;
+        if (key) seen.add(key);
+        out.push({ ...e, _invite_expires_at_ms: expiresAtMs, _invite_expired: expired });
+      } catch (_e) {}
+    }
+    return out;
+  }, [filteredScEvents, showExpiredInvites]);
 
   const knownChannels = useMemo(() => {
     const set = new Set<string>();
@@ -612,8 +650,64 @@ function App() {
       if (c) set.add(c);
     }
     for (const c of scChannels.split(',').map((s) => s.trim()).filter(Boolean)) set.add(c);
+    try {
+      const joined = Array.isArray(preflight?.sc_stats?.channels) ? (preflight.sc_stats.channels as any[]) : [];
+      for (const c of joined) {
+        const ch = String(c || '').trim();
+        if (ch) set.add(ch);
+      }
+    } catch (_e) {}
     return Array.from(set).sort();
-  }, [scEvents, scChannels]);
+  }, [scEvents, scChannels, preflight?.sc_stats]);
+
+  const joinedChannels = useMemo(() => {
+    try {
+      const chans = Array.isArray(preflight?.sc_stats?.channels) ? (preflight.sc_stats.channels as any[]) : [];
+      const out = chans.map((c) => String(c || '').trim()).filter(Boolean);
+      out.sort();
+      return out;
+    } catch (_e) {
+      return [];
+    }
+  }, [preflight?.sc_stats]);
+
+  const watchedChannelsSet = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of scChannels.split(',').map((s) => s.trim()).filter(Boolean)) set.add(c);
+    return set;
+  }, [scChannels]);
+
+  function setWatchedChannels(next: string[]) {
+    const uniq: string[] = [];
+    const seen = new Set<string>();
+    for (const c of next.map((s) => String(s || '').trim()).filter(Boolean)) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      uniq.push(c);
+      if (uniq.length >= 50) break;
+    }
+    setScChannels(uniq.join(','));
+  }
+
+  function watchChannel(channelRaw: string) {
+    const channel = String(channelRaw || '').trim();
+    if (!channel) return;
+    if (watchedChannelsSet.has(channel)) return;
+    const curr = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
+    curr.push(channel);
+    setWatchedChannels(curr);
+    // Restart the stream quickly so the new channel appears without requiring a manual reconnect.
+    setTimeout(() => void startScStream(), 150);
+  }
+
+  function unwatchChannel(channelRaw: string) {
+    const channel = String(channelRaw || '').trim();
+    if (!channel) return;
+    const curr = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
+    const next = curr.filter((c) => c !== channel);
+    setWatchedChannels(next);
+    setTimeout(() => void startScStream(), 150);
+  }
 
   const sellUsdtFeedItems = useMemo(() => {
     const out: any[] = [];
@@ -1762,6 +1856,11 @@ function App() {
       out.sc_info = await runDirectToolOnce('intercomswap_sc_info', {}, { auto_approve: false });
     } catch (e: any) {
       out.sc_info_error = e?.message || String(e);
+    }
+    try {
+      out.sc_stats = await runDirectToolOnce('intercomswap_sc_stats', {}, { auto_approve: false });
+    } catch (e: any) {
+      out.sc_stats_error = e?.message || String(e);
     }
     try {
       const snap = await runDirectToolOnce('intercomswap_sc_price_get', {}, { auto_approve: false });
@@ -3836,78 +3935,201 @@ function App() {
           </div>
         ) : null}
 
-        {activeTab === 'invites' ? (
-          <div className="grid2">
-            <Panel title="Swap Invites">
-              <VirtualList
-                items={inviteEvents}
-                itemKey={(e) => String(e.db_id || e.seq || e.ts || Math.random())}
-                estimatePx={92}
-                render={(e) => (
-                  <InviteRow
-                    evt={e}
-                    onSelect={() => setSelected({ type: 'invite', evt: e })}
-                    onJoin={() => {
-                      if (toolRequiresApproval('intercomswap_join_from_swap_invite') && !autoApprove) {
-                        const ok = window.confirm('Join this swap channel now?');
-                        if (!ok) return;
-                      }
-                      void (async () => {
-                        try {
-                          await runToolFinal('intercomswap_join_from_swap_invite', { swap_invite_envelope: e.message }, { auto_approve: true });
-                          pushToast('success', 'Joined swap channel');
-                        } catch (err: any) {
-                          pushToast('error', err?.message || String(err));
-                        }
-                      })();
-                    }}
-                  />
-                )}
-              />
-            </Panel>
-            <Panel title="Channel Hygiene">
-              <div className="field">
-                <div className="field-hd">
-                  <span className="mono">Leave Channel</span>
-                </div>
-                <input
-                  className="input mono"
-                  value={leaveChannel}
-                  onChange={(e) => setLeaveChannel(e.target.value)}
-                  placeholder="swap:..."
-                />
+	        {activeTab === 'invites' ? (
+	          <div className="grid2">
+	            <Panel title="Swap Invites">
                 <div className="row">
-                  <button
-                    className="btn primary"
-                    disabled={leaveBusy || !leaveChannel.trim()}
-                    onClick={() => {
-                      const channel = leaveChannel.trim();
-                      if (!channel) return;
-                      setLeaveBusy(true);
-                      void (async () => {
-                        try {
-                          if (toolRequiresApproval('intercomswap_sc_leave') && !autoApprove) {
-                            const ok = window.confirm(`Leave channel?\n\n${channel}`);
-                            if (!ok) return;
-                          }
-                          await runToolFinal('intercomswap_sc_leave', { channel }, { auto_approve: true });
-                          pushToast('success', `Left ${channel}`);
-                          setLeaveChannel('');
-                        } catch (err: any) {
-                          pushToast('error', err?.message || String(err));
-                        } finally {
-                          setLeaveBusy(false);
-                        }
-                      })();
-                    }}
-                  >
-                    {leaveBusy ? 'Leaving…' : 'Leave'}
-                  </button>
+                  <label className="row">
+                    <input
+                      type="checkbox"
+                      checked={showExpiredInvites}
+                      onChange={(e) => setShowExpiredInvites(Boolean(e.target.checked))}
+                    />
+                    <span className="mono">show expired</span>
+                  </label>
                 </div>
-              </div>
-            </Panel>
-          </div>
-        ) : null}
+	              <VirtualList
+	                items={inviteEvents}
+	                itemKey={(e) => String(e.db_id || e.seq || e.ts || Math.random())}
+	                estimatePx={92}
+	                render={(e) => (
+	                  <InviteRow
+	                    evt={e}
+	                    onSelect={() => setSelected({ type: 'invite', evt: e })}
+	                    onJoin={() => {
+	                      if (toolRequiresApproval('intercomswap_join_from_swap_invite') && !autoApprove) {
+	                        const ok = window.confirm('Join this swap channel now?');
+	                        if (!ok) return;
+	                      }
+	                      void (async () => {
+	                        try {
+	                          await runToolFinal('intercomswap_join_from_swap_invite', { swap_invite_envelope: e.message }, { auto_approve: true });
+                            try {
+                              const swapCh = String((e as any)?.message?.body?.swap_channel || '').trim();
+                              if (swapCh) watchChannel(swapCh);
+                            } catch (_e) {}
+	                          pushToast('success', 'Joined swap channel');
+                            void refreshPreflight();
+	                        } catch (err: any) {
+	                          pushToast('error', err?.message || String(err));
+	                        }
+	                      })();
+	                    }}
+                      onWatch={() => {
+                        try {
+                          const swapCh = String((e as any)?.message?.body?.swap_channel || '').trim();
+                          if (swapCh) watchChannel(swapCh);
+                        } catch (_e) {}
+                      }}
+                      onLeave={() => {
+                        const swapCh = String((e as any)?.message?.body?.swap_channel || '').trim();
+                        if (!swapCh) return;
+                        if (toolRequiresApproval('intercomswap_sc_leave') && !autoApprove) {
+                          const ok = window.confirm(`Leave channel?\n\n${swapCh}`);
+                          if (!ok) return;
+                        }
+                        void (async () => {
+                          try {
+                            await runToolFinal('intercomswap_sc_leave', { channel: swapCh }, { auto_approve: true });
+                            pushToast('success', `Left ${swapCh}`);
+                            if (watchedChannelsSet.has(swapCh)) unwatchChannel(swapCh);
+                          } catch (err: any) {
+                            pushToast('error', err?.message || String(err));
+                          }
+                        })();
+                      }}
+                      onReceipt={() => {
+                        const tradeId = String((e as any)?.trade_id || (e as any)?.message?.trade_id || '').trim();
+                        if (!tradeId) return;
+                        void (async () => {
+                          try {
+                            const t = await runDirectToolOnce('intercomswap_receipts_show', { ...receiptsDbArg, trade_id: tradeId }, { auto_approve: false });
+                            if (t && typeof t === 'object') {
+                              setSelected({ type: 'trade', trade: t });
+                              setActiveTab('trade_actions');
+                              pushToast('success', `Loaded receipt (${tradeId})`);
+                            } else {
+                              pushToast('info', `No local receipt (${tradeId})`);
+                            }
+                          } catch (err: any) {
+                            pushToast('error', err?.message || String(err));
+                          }
+                        })();
+                      }}
+                      watched={(() => {
+                        try {
+                          const swapCh = String((e as any)?.message?.body?.swap_channel || '').trim();
+                          return swapCh ? watchedChannelsSet.has(swapCh) : false;
+                        } catch (_e) {
+                          return false;
+                        }
+                      })()}
+	                  />
+	                )}
+	              />
+	            </Panel>
+	            <Panel title="Joined Channels">
+                <p className="muted small">Where your peer is currently joined. Leave to stop receiving/sending on that channel.</p>
+                {joinedChannels.length > 0 ? (
+                  <div className="list">
+                    {joinedChannels.slice(0, 100).map((ch) => (
+                      <div key={ch} className="rowitem">
+                        <div className="rowitem-top">
+                          <span className="mono chip hi">{ch}</span>
+                          {watchedChannelsSet.has(ch) ? <span className="mono chip">watched</span> : <span className="mono chip dim">not watched</span>}
+                        </div>
+                        <div className="rowitem-bot">
+                          <button className="btn small" onClick={() => void copyToClipboard('channel', ch)}>
+                            Copy
+                          </button>
+                          {watchedChannelsSet.has(ch) ? (
+                            <button className="btn small" onClick={() => unwatchChannel(ch)}>
+                              Unwatch
+                            </button>
+                          ) : (
+                            <button className="btn small" onClick={() => watchChannel(ch)}>
+                              Watch
+                            </button>
+                          )}
+                          <button
+                            className="btn small"
+                            onClick={() => {
+                              if (toolRequiresApproval('intercomswap_sc_leave') && !autoApprove) {
+                                const ok = window.confirm(`Leave channel?\n\n${ch}`);
+                                if (!ok) return;
+                              }
+                              void (async () => {
+                                try {
+                                  await runToolFinal('intercomswap_sc_leave', { channel: ch }, { auto_approve: true });
+                                  pushToast('success', `Left ${ch}`);
+                                  if (watchedChannelsSet.has(ch)) unwatchChannel(ch);
+                                  void refreshPreflight();
+                                } catch (err: any) {
+                                  pushToast('error', err?.message || String(err));
+                                }
+                              })();
+                            }}
+                          >
+                            Leave
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted">No joined channels reported yet (check Overview -&gt; START and ensure SC-Bridge is up).</p>
+                )}
+
+	              <div className="field">
+	                <div className="field-hd">
+	                  <span className="mono">Leave Channel (manual)</span>
+	                </div>
+	                <input
+	                  className="input mono"
+	                  value={leaveChannel}
+	                  onChange={(e) => setLeaveChannel(e.target.value)}
+	                  placeholder="swap:..."
+                    list="known-channels"
+	                />
+                  <datalist id="known-channels">
+                    {knownChannels.slice(0, 200).map((c) => (
+                      <option key={c} value={c} />
+                    ))}
+                  </datalist>
+	                <div className="row">
+	                  <button
+	                    className="btn primary"
+	                    disabled={leaveBusy || !leaveChannel.trim()}
+	                    onClick={() => {
+	                      const channel = leaveChannel.trim();
+	                      if (!channel) return;
+	                      setLeaveBusy(true);
+	                      void (async () => {
+	                        try {
+	                          if (toolRequiresApproval('intercomswap_sc_leave') && !autoApprove) {
+	                            const ok = window.confirm(`Leave channel?\n\n${channel}`);
+	                            if (!ok) return;
+	                          }
+	                          await runToolFinal('intercomswap_sc_leave', { channel }, { auto_approve: true });
+	                          pushToast('success', `Left ${channel}`);
+                            if (watchedChannelsSet.has(channel)) unwatchChannel(channel);
+	                          setLeaveChannel('');
+                            void refreshPreflight();
+	                        } catch (err: any) {
+	                          pushToast('error', err?.message || String(err));
+	                        } finally {
+	                          setLeaveBusy(false);
+	                        }
+	                      })();
+	                    }}
+	                  >
+	                    {leaveBusy ? 'Leaving…' : 'Leave'}
+	                  </button>
+	                </div>
+	              </div>
+	            </Panel>
+	          </div>
+	        ) : null}
 
 	      {activeTab === 'trade_actions' ? (
 	          <div className="grid2">
@@ -6176,22 +6398,94 @@ function OfferRow({
   );
 }
 
-function InviteRow({ evt, onSelect, onJoin }: { evt: any; onSelect: () => void; onJoin: () => void }) {
-  const body = evt?.message?.body;
-  const swapChannel = body?.swap_channel;
+function InviteRow({
+  evt,
+  onSelect,
+  onJoin,
+  onWatch,
+  onLeave,
+  onReceipt,
+  watched,
+}: {
+  evt: any;
+  onSelect: () => void;
+  onJoin: () => void;
+  onWatch: () => void;
+  onLeave: () => void;
+  onReceipt: () => void;
+  watched: boolean;
+}) {
+  const msg = evt?.message;
+  const body = msg?.body;
+  const swapChannel = String(body?.swap_channel || '').trim();
+  const tradeId = String(evt?.trade_id || msg?.trade_id || '').trim();
+  const expiresAtMs =
+    typeof evt?._invite_expires_at_ms === 'number'
+      ? (evt._invite_expires_at_ms as number)
+      : typeof body?.invite?.payload?.expiresAt === 'number'
+        ? (body.invite.payload.expiresAt as number)
+        : null;
+  const expired = Boolean(evt?._invite_expired);
+  const expIso = expiresAtMs ? msToUtcIso(expiresAtMs) : '';
+
   return (
     <div className="rowitem" role="button" onClick={onSelect}>
       <div className="rowitem-top">
         <span className="mono chip">{evt.channel}</span>
         {swapChannel ? <span className="mono chip hi">{swapChannel}</span> : null}
+        {expired ? <span className="mono chip warn">expired</span> : null}
+        {watched ? <span className="mono chip">watched</span> : null}
       </div>
       <div className="rowitem-mid">
         <span className="mono">swap_invite</span>
+        {tradeId ? <span className="mono dim">trade_id: {tradeId}</span> : null}
+        {expIso ? <span className="mono dim">expires: {expIso}</span> : null}
       </div>
       <div className="rowitem-bot">
-        <button className="btn small primary" onClick={(e) => { e.stopPropagation(); onJoin(); }}>
+        <button
+          className="btn small primary"
+          onClick={(e) => {
+            e.stopPropagation();
+            onJoin();
+          }}
+        >
           Join
         </button>
+        {swapChannel ? (
+          <button
+            className="btn small"
+            onClick={(e) => {
+              e.stopPropagation();
+              onWatch();
+            }}
+            disabled={watched}
+            title={watched ? 'Already watched' : ''}
+          >
+            Watch
+          </button>
+        ) : null}
+        {swapChannel ? (
+          <button
+            className="btn small"
+            onClick={(e) => {
+              e.stopPropagation();
+              onLeave();
+            }}
+          >
+            Leave
+          </button>
+        ) : null}
+        {tradeId ? (
+          <button
+            className="btn small"
+            onClick={(e) => {
+              e.stopPropagation();
+              onReceipt();
+            }}
+          >
+            Receipt
+          </button>
+        ) : null}
       </div>
     </div>
   );
