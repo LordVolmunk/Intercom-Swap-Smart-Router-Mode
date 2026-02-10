@@ -24,6 +24,7 @@ import { INTERCOMSWAP_APP_TAG, deriveIntercomswapAppHash } from '../swap/app.js'
 import { hashUnsignedEnvelope, sha256Hex } from '../swap/hash.js';
 import { hashTermsEnvelope } from '../swap/terms.js';
 import { verifySwapPrePayOnchain } from '../swap/verify.js';
+import { AutopostManager } from './autopost.js';
 import {
   createSignedWelcome,
   createSignedInvite,
@@ -405,6 +406,10 @@ export class ToolExecutor {
     this._peerSigning = null; // { pubHex, secHex }
     this._solanaKeypair = null;
     this._solanaPool = null;
+
+    this._autopost = new AutopostManager({
+      runTool: async ({ tool, args }) => this.execute(tool, args, { autoApprove: true, dryRun: false, secrets: null }),
+    });
   }
 
   _pool() {
@@ -665,6 +670,32 @@ export class ToolExecutor {
       const programId = this._programId().toBase58();
       const appHash = deriveIntercomswapAppHash({ solanaProgramId: programId, appTag: INTERCOMSWAP_APP_TAG });
       return { type: 'app_info', app_tag: INTERCOMSWAP_APP_TAG, solana_program_id: programId, app_hash: appHash };
+    }
+
+    // Autopost (simple periodic offer/rfq broadcast)
+    if (toolName === 'intercomswap_autopost_status') {
+      assertAllowedKeys(args, toolName, ['name']);
+      const name = expectOptionalString(args, toolName, 'name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      return this._autopost.status({ name: name || '' });
+    }
+    if (toolName === 'intercomswap_autopost_start') {
+      assertAllowedKeys(args, toolName, ['name', 'tool', 'interval_sec', 'ttl_sec', 'args']);
+      requireApproval(toolName, autoApprove);
+      const name = expectString(args, toolName, 'name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      const tool = expectString(args, toolName, 'tool', { min: 1, max: 128 });
+      const intervalSec = expectInt(args, toolName, 'interval_sec', { min: 5, max: 24 * 3600 });
+      const ttlSec = expectInt(args, toolName, 'ttl_sec', { min: 10, max: 7 * 24 * 3600 });
+      const subArgs = args.args;
+      if (!isObject(subArgs)) throw new Error(`${toolName}: args must be an object`);
+      if (dryRun) return { type: 'dry_run', tool: toolName, name, tool_name: tool, interval_sec: intervalSec, ttl_sec: ttlSec, args: subArgs };
+      return await this._autopost.start({ name, tool, interval_sec: intervalSec, ttl_sec: ttlSec, args: subArgs });
+    }
+    if (toolName === 'intercomswap_autopost_stop') {
+      assertAllowedKeys(args, toolName, ['name']);
+      requireApproval(toolName, autoApprove);
+      const name = expectString(args, toolName, 'name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      if (dryRun) return { type: 'dry_run', tool: toolName, name };
+      return await this._autopost.stop({ name });
     }
 
     if (toolName === 'intercomswap_env_get') {

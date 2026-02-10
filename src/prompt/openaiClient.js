@@ -44,6 +44,24 @@ function toolsToLegacyFunctions(tools) {
     }));
 }
 
+function parseMaxTokensBudgetError(msg) {
+  const s = String(msg || '');
+  // Example (Qwen/OpenAI-compatible):
+  // "'max_tokens' or 'max_completion_tokens' is too large: 8000. This model's maximum context length is 32768 tokens and your request has 25060 input tokens (8000 > 32768 - 25060)."
+  const m = s.match(/too large:\s*(\d+).+maximum context length is\s*(\d+)\s*tokens.+request has\s*(\d+)\s*input tokens/i);
+  if (!m) return null;
+  const asked = Number.parseInt(m[1], 10);
+  const ctx = Number.parseInt(m[2], 10);
+  const input = Number.parseInt(m[3], 10);
+  if (!Number.isFinite(asked) || !Number.isFinite(ctx) || !Number.isFinite(input)) return null;
+  if (ctx <= 0 || input < 0) return null;
+  const remaining = ctx - input;
+  if (!Number.isFinite(remaining) || remaining <= 0) return 0;
+  // Leave a small margin so we don’t retry into a borderline failure.
+  const margin = 256;
+  return Math.max(1, remaining - margin);
+}
+
 export class OpenAICompatibleClient {
   constructor({
     baseUrl,
@@ -80,94 +98,116 @@ export class OpenAICompatibleClient {
     if (!reqModel) throw new Error('Missing LLM model');
     if (!Array.isArray(messages)) throw new Error('messages must be an array');
 
-    const body = {
-      model: reqModel,
-      messages,
-      stream: false,
-    };
+    let curMaxTokens = maxTokens;
+    let retries = 0;
+    const maxRetries = 1;
 
-    if (maxTokens && maxTokens > 0) body.max_tokens = maxTokens;
-    maybeAdd(body, 'temperature', temperature);
-    maybeAdd(body, 'top_p', topP);
-
-    // Non-standard tuning params (pass-through).
-    maybeAdd(body, 'top_k', topK);
-    maybeAdd(body, 'min_p', minP);
-    maybeAdd(body, 'repetition_penalty', repetitionPenalty);
-
-    const toolFormat = this.toolFormat === 'functions' ? 'functions' : 'tools';
-    if (Array.isArray(tools) && tools.length > 0) {
-      if (toolFormat === 'tools') {
-        body.tools = tools;
-        // OpenAI: { tool_choice: 'auto' | 'none' | { type:'function', function:{name} } }
-        if (toolChoice !== undefined && toolChoice !== null) body.tool_choice = toolChoice;
-      } else {
-        body.functions = toolsToLegacyFunctions(tools);
-        if (toolChoice !== undefined && toolChoice !== null) body.function_call = toolChoice;
-      }
-    }
-
-    if (extraBody && typeof extraBody === 'object') {
-      for (const [k, v] of Object.entries(extraBody)) {
-        if (v === undefined) continue;
-        body[k] = v;
-      }
-    }
-
-    const headers = {
-      'Content-Type': 'application/json',
-      ...headersForUrl(url),
-    };
-    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
-
-    const { signal: timeoutSignal, cleanup } = withTimeout(signal, this.timeoutMs);
-    try {
-      const res = await this.fetchImpl(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: timeoutSignal,
-      });
-      const text = await res.text();
-      let json = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch (_e) {
-        json = null;
-      }
-      if (!res.ok) {
-        const msg = json?.error?.message || json?.message || text || `HTTP ${res.status}`;
-        const err = new Error(`LLM error: ${msg}`);
-        err.status = res.status;
-        err.body = json ?? text;
-        throw err;
-      }
-      if (!json || typeof json !== 'object') {
-        const ct = res.headers?.get ? res.headers.get('content-type') : '';
-        const snippet = (text || '').slice(0, 400);
-        const err = new Error(
-          `LLM error: invalid JSON response (status=${res.status}, content-type=${ct || 'unknown'}): ${snippet}`
-        );
-        err.status = res.status;
-        err.body = text;
-        throw err;
-      }
-
-      const toolCalls = extractToolCallsFromChatCompletion(json);
-      const choice = json?.choices?.[0] ?? null;
-      const message = choice?.message ?? null;
-      const content = typeof message?.content === 'string' ? message.content : '';
-
-      return {
-        raw: json,
-        message,
-        content,
-        toolCalls,
-        finishReason: choice?.finish_reason ?? null,
-        usage: json?.usage ?? null,
+    while (true) {
+      const body = {
+        model: reqModel,
+        messages,
+        stream: false,
       };
-    } finally {
-      cleanup();
+
+      if (curMaxTokens && curMaxTokens > 0) body.max_tokens = curMaxTokens;
+      maybeAdd(body, 'temperature', temperature);
+      maybeAdd(body, 'top_p', topP);
+
+      // Non-standard tuning params (pass-through).
+      maybeAdd(body, 'top_k', topK);
+      maybeAdd(body, 'min_p', minP);
+      maybeAdd(body, 'repetition_penalty', repetitionPenalty);
+
+      const toolFormat = this.toolFormat === 'functions' ? 'functions' : 'tools';
+      if (Array.isArray(tools) && tools.length > 0) {
+        if (toolFormat === 'tools') {
+          body.tools = tools;
+          // OpenAI: { tool_choice: 'auto' | 'none' | { type:'function', function:{name} } }
+          if (toolChoice !== undefined && toolChoice !== null) body.tool_choice = toolChoice;
+        } else {
+          body.functions = toolsToLegacyFunctions(tools);
+          if (toolChoice !== undefined && toolChoice !== null) body.function_call = toolChoice;
+        }
+      }
+
+      if (extraBody && typeof extraBody === 'object') {
+        for (const [k, v] of Object.entries(extraBody)) {
+          if (v === undefined) continue;
+          body[k] = v;
+        }
+      }
+
+      const headers = {
+        'Content-Type': 'application/json',
+        ...headersForUrl(url),
+      };
+      if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+
+      const { signal: timeoutSignal, cleanup } = withTimeout(signal, this.timeoutMs);
+      try {
+        const res = await this.fetchImpl(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: timeoutSignal,
+        });
+        const text = await res.text();
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch (_e) {
+          json = null;
+        }
+        if (!res.ok) {
+          const msg = json?.error?.message || json?.message || text || `HTTP ${res.status}`;
+
+          // Some OpenAI-compatible backends reject requests when max_tokens exceeds the
+          // remaining budget (context_limit - input_tokens). Retry once with a clamped value.
+          const clamp = parseMaxTokensBudgetError(msg);
+          if (
+            retries < maxRetries &&
+            typeof clamp === 'number' &&
+            clamp > 0 &&
+            Number.isInteger(curMaxTokens) &&
+            curMaxTokens > clamp
+          ) {
+            retries += 1;
+            curMaxTokens = clamp;
+            continue;
+          }
+
+          const err = new Error(`LLM error: ${msg}`);
+          err.status = res.status;
+          err.body = json ?? text;
+          throw err;
+        }
+        if (!json || typeof json !== 'object') {
+          const ct = res.headers?.get ? res.headers.get('content-type') : '';
+          const snippet = (text || '').slice(0, 400);
+          const err = new Error(
+            `LLM error: invalid JSON response (status=${res.status}, content-type=${ct || 'unknown'}): ${snippet}`
+          );
+          err.status = res.status;
+          err.body = text;
+          throw err;
+        }
+
+        const toolCalls = extractToolCallsFromChatCompletion(json);
+        const choice = json?.choices?.[0] ?? null;
+        const message = choice?.message ?? null;
+        const content = typeof message?.content === 'string' ? message.content : '';
+
+        return {
+          raw: json,
+          message,
+          content,
+          toolCalls,
+          finishReason: choice?.finish_reason ?? null,
+          usage: json?.usage ?? null,
+        };
+      } finally {
+        cleanup();
+      }
     }
   }
 }

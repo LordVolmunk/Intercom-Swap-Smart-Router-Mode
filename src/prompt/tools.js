@@ -551,6 +551,36 @@ export const INTERCOMSWAP_TOOLS = [
     required: ['name'],
   }),
 
+  // Autopost (simple periodic offer/rfq broadcast; in-process scheduler).
+  tool('intercomswap_autopost_status', 'List in-process autopost jobs started via tools (offer/rfq repost schedulers).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$', description: 'Optional job id.' },
+    },
+    required: [],
+  }),
+  tool('intercomswap_autopost_start', 'Start a periodic repost scheduler for offer_post or rfq_post.', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+      tool: { type: 'string', enum: ['intercomswap_offer_post', 'intercomswap_rfq_post'] },
+      interval_sec: { type: 'integer', minimum: 5, maximum: 86400, description: 'How often to repost.' },
+      ttl_sec: { type: 'integer', minimum: 10, maximum: 7 * 24 * 3600, description: 'Validity window (seconds) kept fresh on each repost.' },
+      args: { type: 'object', additionalProperties: true, description: 'Arguments for the selected tool.' },
+    },
+    required: ['name', 'tool', 'interval_sec', 'ttl_sec', 'args'],
+  }),
+  tool('intercomswap_autopost_stop', 'Stop an autopost job (by name).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+    },
+    required: ['name'],
+  }),
+
   tool('intercomswap_terms_post', 'Maker: post signed TERMS envelope inside swap:<id>.', {
     type: 'object',
     additionalProperties: false,
