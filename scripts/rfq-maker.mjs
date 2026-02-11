@@ -453,6 +453,7 @@ async function main() {
     ctx.trade = applied.trade;
     ctx.sent.terms = signed;
     await sc.send(ctx.swapChannel, signed, { invite: ctx.invite || null });
+    ctx.lastTermsSendAtMs = Date.now();
     process.stdout.write(`${JSON.stringify({ type: 'terms_sent', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel })}\n`);
 
     persistTrade(
@@ -527,6 +528,7 @@ async function main() {
     }
     ctx.sent.invoice = lnInvSigned;
     await sc.send(ctx.swapChannel, lnInvSigned, { invite: ctx.invite || null });
+    ctx.lastInvoiceSendAtMs = Date.now();
     process.stdout.write(`${JSON.stringify({ type: 'ln_invoice_sent', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, payment_hash_hex: paymentHashHex })}\n`);
 
     persistTrade(
@@ -598,6 +600,7 @@ async function main() {
     }
     ctx.sent.escrow = solEscrowSigned;
     await sc.send(ctx.swapChannel, solEscrowSigned, { invite: ctx.invite || null });
+    ctx.lastEscrowSendAtMs = Date.now();
     process.stdout.write(`${JSON.stringify({ type: 'sol_escrow_sent', trade_id: ctx.tradeId, swap_channel: ctx.swapChannel, tx_sig: escrowSig })}\n`);
 
     persistTrade(
@@ -635,14 +638,33 @@ async function main() {
           if (once) die(reason);
           return;
         }
-        if (ctx.trade.state === STATE.TERMS && ctx.sent.terms) {
+        const nowMs = Date.now();
+        const lastRemoteMs = Number(ctx.lastRemoteActivityAtMs || 0);
+        const idleMs = lastRemoteMs > 0 ? nowMs - lastRemoteMs : Number.POSITIVE_INFINITY;
+        const termsCadenceMs = idleMs > 30_000 ? Math.max(swapResendMs, 10_000) : Math.max(swapResendMs, 4_000);
+        const invoiceCadenceMs = idleMs > 30_000 ? Math.max(swapResendMs, 12_000) : Math.max(swapResendMs, 5_000);
+
+        if (ctx.trade.state === STATE.TERMS && ctx.sent.terms && (nowMs - Number(ctx.lastTermsSendAtMs || 0) >= termsCadenceMs)) {
           await sc.send(ctx.swapChannel, ctx.sent.terms, { invite: ctx.invite || null });
+          ctx.lastTermsSendAtMs = nowMs;
         }
-        if ([STATE.ACCEPTED, STATE.INVOICE, STATE.ESCROW].includes(ctx.trade.state) && ctx.sent.invoice && !ctx.trade.ln_paid) {
+        if (
+          [STATE.ACCEPTED, STATE.INVOICE, STATE.ESCROW].includes(ctx.trade.state) &&
+          ctx.sent.invoice &&
+          !ctx.trade.ln_paid &&
+          (nowMs - Number(ctx.lastInvoiceSendAtMs || 0) >= invoiceCadenceMs)
+        ) {
           await sc.send(ctx.swapChannel, ctx.sent.invoice, { invite: ctx.invite || null });
+          ctx.lastInvoiceSendAtMs = nowMs;
         }
-        if ([STATE.INVOICE, STATE.ESCROW].includes(ctx.trade.state) && ctx.sent.escrow && !ctx.trade.ln_paid) {
+        if (
+          [STATE.INVOICE, STATE.ESCROW].includes(ctx.trade.state) &&
+          ctx.sent.escrow &&
+          !ctx.trade.ln_paid &&
+          (nowMs - Number(ctx.lastEscrowSendAtMs || 0) >= invoiceCadenceMs)
+        ) {
           await sc.send(ctx.swapChannel, ctx.sent.escrow, { invite: ctx.invite || null });
+          ctx.lastEscrowSendAtMs = nowMs;
         }
       } catch (_e) {}
     }, Math.max(swapResendMs, 200));
@@ -658,6 +680,7 @@ async function main() {
       if (swaps.has(evt.channel)) {
         const ctx = swaps.get(evt.channel);
         if (!ctx) return;
+        ctx.lastRemoteActivityAtMs = Date.now();
         const v = validateSwapEnvelope(msg);
         if (!v.ok) return;
         const r = applySwapEnvelope(ctx.trade, msg);
@@ -990,6 +1013,10 @@ async function main() {
             done: false,
             deadlineMs: Date.now() + swapTimeoutSec * 1000,
             resender: null,
+            lastRemoteActivityAtMs: Date.now(),
+            lastTermsSendAtMs: 0,
+            lastInvoiceSendAtMs: 0,
+            lastEscrowSendAtMs: 0,
           };
           swaps.set(swapChannel, ctx);
           if (lock) {

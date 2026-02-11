@@ -1178,7 +1178,16 @@ export class TradeAutoManager {
           const tradeId = envelopeTradeId(e);
           if (tradeId && ctx.terminalTradeIds.has(tradeId)) continue;
           const invitee = String(e?.message?.body?.invite?.payload?.inviteePubKey || '').trim().toLowerCase();
-          if (invitee && localPeer && invitee !== localPeer) continue;
+          if (invitee && localPeer && invitee !== localPeer) {
+            this._trace('auto_join_skip_invitee_mismatch', {
+              trade_id: tradeId,
+              channel: String(e?.channel || '').trim(),
+              invite_sig: sig.slice(0, 16),
+              invitee,
+              local_peer: localPeer,
+            });
+            continue;
+          }
           try {
             const out = await this._runToolWithTimeout({
               tool: 'intercomswap_join_from_swap_invite',
