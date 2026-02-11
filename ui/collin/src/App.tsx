@@ -1332,6 +1332,25 @@ function App() {
     setTimeout(() => void startScStream(), 150);
   }
 
+  // Keep UI watchlist aligned with actual joined swap channels.
+  // This prevents "joined but unwatched" confusion and ensures swap channel events are streamed in UI.
+  useEffect(() => {
+    if (!health?.ok) return;
+    if (!Array.isArray(joinedChannels) || joinedChannels.length < 1) return;
+    const missing: string[] = [];
+    for (const chRaw of joinedChannels) {
+      const ch = String(chRaw || '').trim();
+      if (!ch || !ch.startsWith('swap:')) continue;
+      if (watchedChannelsSet.has(ch)) continue;
+      missing.push(ch);
+    }
+    if (missing.length < 1) return;
+    const curr = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
+    setWatchedChannels([...curr, ...missing]);
+    setTimeout(() => void startScStream(), 150);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [health?.ok, joinedChannels, watchedChannelsSet, scChannels]);
+
   async function acceptQuoteEnvelope(quoteEvt: any, opts: { origin: 'manual' }) {
     const channel = String((quoteEvt as any)?.channel || '').trim();
     const msg = quoteEvt?.message;
@@ -5564,7 +5583,8 @@ function App() {
                       watched={(() => {
                         try {
                           const swapCh = String((e as any)?.message?.body?.swap_channel || '').trim();
-                          return swapCh ? watchedChannelsSet.has(swapCh) : false;
+                          if (!swapCh) return false;
+                          return watchedChannelsSet.has(swapCh) || joinedChannelsSet.has(swapCh);
                         } catch (_e) {
                           return false;
                         }
