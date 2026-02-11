@@ -1629,41 +1629,96 @@ function App() {
     return `${prefix}x`;
   }
 
+  function toggleSellUsdtSection(section: 'inbox' | 'mine') {
+    if (section === 'inbox') {
+      setSellUsdtInboxOpen((prev) => {
+        const next = !prev;
+        if (next) setSellUsdtMyOpen(false);
+        return next;
+      });
+      return;
+    }
+    setSellUsdtMyOpen((prev) => {
+      const next = !prev;
+      if (next) setSellUsdtInboxOpen(false);
+      return next;
+    });
+  }
+
+  function toggleSellBtcSection(section: 'offers' | 'quotes' | 'mine') {
+    if (section === 'offers') {
+      setSellBtcInboxOpen((prev) => {
+        const next = !prev;
+        if (next) {
+          setSellBtcQuotesOpen(false);
+          setSellBtcMyOpen(false);
+        }
+        return next;
+      });
+      return;
+    }
+    if (section === 'quotes') {
+      setSellBtcQuotesOpen((prev) => {
+        const next = !prev;
+        if (next) {
+          setSellBtcInboxOpen(false);
+          setSellBtcMyOpen(false);
+        }
+        return next;
+      });
+      return;
+    }
+    setSellBtcMyOpen((prev) => {
+      const next = !prev;
+      if (next) {
+        setSellBtcInboxOpen(false);
+        setSellBtcQuotesOpen(false);
+      }
+      return next;
+    });
+  }
+
   const sellUsdtFeedItems = useMemo(() => {
     const out: any[] = [];
-    out.push({ _t: 'header', id: 'h:inboxrfqs', title: 'RFQ Inbox', count: rfqEvents.length, open: sellUsdtInboxOpen, onToggle: () => setSellUsdtInboxOpen((v) => !v) });
+    out.push({ _t: 'header', id: 'h:inboxrfqs', title: 'RFQ Inbox', count: rfqEvents.length, open: sellUsdtInboxOpen, onToggle: () => toggleSellUsdtSection('inbox') });
     if (sellUsdtInboxOpen) {
       for (let i = 0; i < rfqEvents.length; i += 1) {
         const e = rfqEvents[i];
         out.push({ _t: 'rfq', id: feedEventId('inrfq:', e, i), evt: e });
       }
     }
-    out.push({ _t: 'header', id: 'h:myoffers', title: 'My Offers', count: myOfferPosts.length, open: sellUsdtMyOpen, onToggle: () => setSellUsdtMyOpen((v) => !v) });
+    out.push({ _t: 'header', id: 'h:myoffers', title: 'My Offers', count: myOfferPosts.length, open: sellUsdtMyOpen, onToggle: () => toggleSellUsdtSection('mine') });
     if (sellUsdtMyOpen) {
-      for (const e of myOfferPosts) out.push({ _t: 'offer', id: `my:${e.svc_announce_id || e.trade_id || e.ts}`, evt: e, badge: 'outbox' });
+      for (let i = 0; i < myOfferPosts.length; i += 1) {
+        const e = myOfferPosts[i];
+        out.push({ _t: 'offer', id: feedEventId('myoffer:', e, i), evt: e, badge: 'outbox' });
+      }
     }
     return out;
   }, [myOfferPosts, rfqEvents, sellUsdtInboxOpen, sellUsdtMyOpen]);
 
   const sellBtcFeedItems = useMemo(() => {
     const out: any[] = [];
-    out.push({ _t: 'header', id: 'h:inboxoffers', title: 'Offer Inbox', count: offerEvents.length, open: sellBtcInboxOpen, onToggle: () => setSellBtcInboxOpen((v) => !v) });
+    out.push({ _t: 'header', id: 'h:inboxoffers', title: 'Offer Inbox', count: offerEvents.length, open: sellBtcInboxOpen, onToggle: () => toggleSellBtcSection('offers') });
     if (sellBtcInboxOpen) {
       for (let i = 0; i < offerEvents.length; i += 1) {
         const e = offerEvents[i];
         out.push({ _t: 'offer', id: feedEventId('inoffer:', e, i), evt: e });
       }
     }
-    out.push({ _t: 'header', id: 'h:inboxquotes', title: 'Quote Inbox', count: quoteEvents.length, open: sellBtcQuotesOpen, onToggle: () => setSellBtcQuotesOpen((v) => !v) });
+    out.push({ _t: 'header', id: 'h:inboxquotes', title: 'Quote Inbox', count: quoteEvents.length, open: sellBtcQuotesOpen, onToggle: () => toggleSellBtcSection('quotes') });
     if (sellBtcQuotesOpen) {
       for (let i = 0; i < quoteEvents.length; i += 1) {
         const e = quoteEvents[i];
         out.push({ _t: 'quote', id: feedEventId('inq:', e, i), evt: e });
       }
     }
-    out.push({ _t: 'header', id: 'h:myrfqs', title: 'My RFQs', count: myRfqPosts.length, open: sellBtcMyOpen, onToggle: () => setSellBtcMyOpen((v) => !v) });
+    out.push({ _t: 'header', id: 'h:myrfqs', title: 'My RFQs', count: myRfqPosts.length, open: sellBtcMyOpen, onToggle: () => toggleSellBtcSection('mine') });
     if (sellBtcMyOpen) {
-      for (const e of myRfqPosts) out.push({ _t: 'rfq', id: `my:${e.rfq_id || e.trade_id || e.ts}`, evt: e, badge: 'outbox' });
+      for (let i = 0; i < myRfqPosts.length; i += 1) {
+        const e = myRfqPosts[i];
+        out.push({ _t: 'rfq', id: feedEventId('myrfq:', e, i), evt: e, badge: 'outbox' });
+      }
     }
     return out;
   }, [offerEvents, quoteEvents, myRfqPosts, sellBtcInboxOpen, sellBtcQuotesOpen, sellBtcMyOpen]);

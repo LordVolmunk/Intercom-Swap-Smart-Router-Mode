@@ -103,6 +103,12 @@ function isUnknownFlagError(err, flagName) {
   return msg.includes(name);
 }
 
+function includesFlag(args, flagName) {
+  const name = String(flagName || '').trim().toLowerCase();
+  if (!name) return false;
+  return Array.isArray(args) && args.some((a) => String(a || '').trim().toLowerCase() === name);
+}
+
 async function execCli({ cmd, args, cwd }) {
   try {
     const { stdout } = await execFileP(cmd, args, { cwd, maxBuffer: 1024 * 1024 * 50 });
@@ -449,16 +455,23 @@ export async function lnPay(
       if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) throw new Error('Invalid feeLimitSat');
       feeLimitInt = n;
     }
-    const buildLndPayArgs = (feeFlag = '--fee_limit_sat') => {
+    const buildLndPayArgs = ({
+      feeFlag = '--fee_limit_sat',
+      includeFeeLimit = true,
+      outgoingFlag = '--outgoing_chan_id',
+      includeOutgoing = true,
+      includeAllowSelf = true,
+      includeLastHop = true,
+    } = {}) => {
       const args = ['payinvoice', '--force', '--json'];
-      if (allowSelfPayment) args.push('--allow_self_payment');
-      if (feeLimitInt !== null) args.push(feeFlag, String(feeLimitInt));
-      if (outgoingChanId !== null && outgoingChanId !== undefined) {
+      if (allowSelfPayment && includeAllowSelf) args.push('--allow_self_payment');
+      if (feeLimitInt !== null && includeFeeLimit) args.push(feeFlag, String(feeLimitInt));
+      if (includeOutgoing && outgoingChanId !== null && outgoingChanId !== undefined) {
         const s = String(outgoingChanId).trim();
         if (!/^[0-9]+$/.test(s)) throw new Error('Invalid outgoingChanId (expected numeric chan_id)');
-        args.push('--outgoing_chan_id', s);
+        args.push(outgoingFlag, s);
       }
-      if (lastHopPubkey !== null && lastHopPubkey !== undefined) {
+      if (includeLastHop && lastHopPubkey !== null && lastHopPubkey !== undefined) {
         const s = String(lastHopPubkey).trim().toLowerCase();
         if (!/^[0-9a-f]{66}$/i.test(s)) throw new Error('Invalid lastHopPubkey (expected hex33)');
         args.push('--last_hop', s);
@@ -467,17 +480,62 @@ export async function lnPay(
       return args;
     };
 
+    const payCfg = {
+      feeFlag: '--fee_limit_sat',
+      includeFeeLimit: true,
+      outgoingFlag: '--outgoing_chan_id',
+      includeOutgoing: true,
+      includeAllowSelf: true,
+      includeLastHop: true,
+    };
+
     let r;
-    try {
-      r = await lnLndCli({ ...opts, args: buildLndPayArgs('--fee_limit_sat') });
-    } catch (err) {
-      // lncli versions differ: some use --fee_limit instead of --fee_limit_sat.
-      if (feeLimitInt !== null && isUnknownFlagError(err, '--fee_limit_sat')) {
-        r = await lnLndCli({ ...opts, args: buildLndPayArgs('--fee_limit') });
-      } else {
+    let lastErr = null;
+    for (let i = 0; i < 8; i += 1) {
+      try {
+        r = await lnLndCli({ ...opts, args: buildLndPayArgs(payCfg) });
+        break;
+      } catch (err) {
+        lastErr = err;
+        const runArgs = buildLndPayArgs(payCfg);
+        if (payCfg.includeFeeLimit && payCfg.feeFlag === '--fee_limit_sat' && isUnknownFlagError(err, '--fee_limit_sat')) {
+          payCfg.feeFlag = '--fee_limit';
+          continue;
+        }
+        if (payCfg.includeFeeLimit && payCfg.feeFlag === '--fee_limit' && isUnknownFlagError(err, '--fee_limit')) {
+          payCfg.includeFeeLimit = false;
+          continue;
+        }
+        if (payCfg.includeOutgoing && includesFlag(runArgs, '--outgoing_chan_id') && isUnknownFlagError(err, '--outgoing_chan_id')) {
+          payCfg.outgoingFlag = '--outgoing_chan_ids';
+          continue;
+        }
+        if (payCfg.includeOutgoing && includesFlag(runArgs, '--outgoing_chan_ids') && isUnknownFlagError(err, '--outgoing_chan_ids')) {
+          payCfg.includeOutgoing = false;
+          continue;
+        }
+        if (payCfg.includeAllowSelf && includesFlag(runArgs, '--allow_self_payment') && isUnknownFlagError(err, '--allow_self_payment')) {
+          payCfg.includeAllowSelf = false;
+          continue;
+        }
+        if (payCfg.includeLastHop && includesFlag(runArgs, '--last_hop') && isUnknownFlagError(err, '--last_hop')) {
+          payCfg.includeLastHop = false;
+          continue;
+        }
+        // Some lncli builds may report unknown flags without quoting the exact one.
+        // As a final compatibility fallback, strip optional knobs and retry once.
+        const unknownAny = /flag provided but not defined|unknown flag/i.test(String(err?.message || ''));
+        if (unknownAny) {
+          payCfg.includeFeeLimit = false;
+          payCfg.includeOutgoing = false;
+          payCfg.includeAllowSelf = false;
+          payCfg.includeLastHop = false;
+          continue;
+        }
         throw err;
       }
     }
+    if (!r) throw lastErr || new Error('LND payinvoice failed');
     const preimageHex =
       decodeMaybeB64Hex(r?.payment_preimage) ||
       decodeMaybeB64Hex(r?.paymentPreimage) ||
