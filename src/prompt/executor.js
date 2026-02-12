@@ -79,6 +79,12 @@ import {
 } from '../solana/lnUsdtEscrowClient.js';
 import { buildComputeBudgetIxs } from '../solana/computeBudget.js';
 import { isSecretHandle } from './secrets.js';
+import {
+  SOL_ESCROW_GUARDRAIL_CONSTANTS,
+  computeEscrowInitLamportsGuardrail,
+  parseFeeLamports,
+  parseInsufficientLamports,
+} from './solEscrowGuardrail.js';
 
 function isObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
@@ -5848,7 +5854,50 @@ export class ToolExecutor {
         });
       }, { label: 'swap_sol_escrow_build' });
 
-      const escrowSig = await this._pool().call((connection) => sendAndConfirm(connection, build.tx, commitment), { label: 'swap_sol_escrow_send' });
+      const solEscrowFunding = await this._pool().call(async (connection) => {
+        const [payerLamportsRaw, infos, feeResp, escrowRent, tokenRent] = await Promise.all([
+          connection.getBalance(signer.publicKey, commitment),
+          connection.getMultipleAccountsInfo(
+            [build.escrowPda, build.vault, build.platformFeeVaultAta, build.tradeFeeVaultAta],
+            commitment
+          ),
+          connection.getFeeForMessage(build.tx.compileMessage(), commitment),
+          connection.getMinimumBalanceForRentExemption(SOL_ESCROW_GUARDRAIL_CONSTANTS.ESCROW_STATE_V3_SPACE, commitment),
+          connection.getMinimumBalanceForRentExemption(SOL_ESCROW_GUARDRAIL_CONSTANTS.SPL_TOKEN_ACCOUNT_SPACE, commitment),
+        ]);
+        const feeLamports = parseFeeLamports(feeResp) ?? 5_000;
+        return computeEscrowInitLamportsGuardrail({
+          payerLamports: payerLamportsRaw,
+          feeLamports,
+          escrowRentLamports: escrowRent,
+          tokenAccountRentLamports: tokenRent,
+          hasEscrowAccount: Boolean(infos?.[0]),
+          hasVaultAccount: Boolean(infos?.[1]),
+          hasPlatformFeeVaultAccount: Boolean(infos?.[2]),
+          hasTradeFeeVaultAccount: Boolean(infos?.[3]),
+        });
+      }, { label: 'swap_sol_escrow_funding_guardrail' });
+      if (!solEscrowFunding.ok) {
+        throw new Error(
+          `${toolName}: insufficient SOL for escrow init ` +
+            `(need_lamports>=${solEscrowFunding.need_lamports}, have_lamports=${solEscrowFunding.have_lamports}, ` +
+            `shortfall_lamports=${solEscrowFunding.shortfall_lamports}, missing_accounts=${solEscrowFunding.missing_accounts.join(',') || 'none'})`
+        );
+      }
+
+      let escrowSig;
+      try {
+        escrowSig = await this._pool().call((connection) => sendAndConfirm(connection, build.tx, commitment), { label: 'swap_sol_escrow_send' });
+      } catch (err) {
+        const parsed = parseInsufficientLamports(err?.message || String(err));
+        if (parsed) {
+          throw new Error(
+            `${toolName}: insufficient SOL for escrow init ` +
+              `(need_lamports=${parsed.need_lamports}, have_lamports=${parsed.have_lamports}, shortfall_lamports=${parsed.shortfall_lamports})`
+          );
+        }
+        throw err;
+      }
 
       store.upsertTrade(tradeId, {
         role: 'maker',

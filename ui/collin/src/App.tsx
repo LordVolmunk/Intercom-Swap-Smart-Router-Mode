@@ -249,6 +249,43 @@ function compareScEventsNewestFirst(a: any, b: any): number {
   return bsq - asq;
 }
 
+function stableKeyStringify(value: any, depth = 0): string {
+  if (depth > 24) return '"[max-depth]"';
+  if (value === null) return 'null';
+  if (value === undefined) return '"[undefined]"';
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => stableKeyStringify(v, depth + 1)).join(',')}]`;
+  }
+  const t = typeof value;
+  if (t === 'string') return JSON.stringify(value);
+  if (t === 'number') return Number.isFinite(value) ? `n:${String(value)}` : '"[non-finite-number]"';
+  if (t === 'boolean') return value ? 'true' : 'false';
+  if (t === 'bigint') return `bi:${value.toString(10)}`;
+  if (t === 'object') {
+    const obj = value as Record<string, any>;
+    const keys = Object.keys(obj).sort((a, b) => a.localeCompare(b));
+    const parts: string[] = [];
+    for (const k of keys) {
+      const v = obj[k];
+      if (v === undefined) continue;
+      parts.push(`${JSON.stringify(k)}:${stableKeyStringify(v, depth + 1)}`);
+    }
+    return `{${parts.join(',')}}`;
+  }
+  return JSON.stringify(String(value));
+}
+
+function listingBodyFingerprint(evt: any): string {
+  try {
+    const msg = evt && typeof evt === 'object' ? (evt as any).message : null;
+    const body = msg && typeof msg === 'object' && msg.body && typeof msg.body === 'object' ? msg.body : null;
+    if (!body) return '';
+    return stableKeyStringify(body);
+  } catch (_e) {
+    return '';
+  }
+}
+
 function listingRepostKey(evt: any): string {
   if (!evt || typeof evt !== 'object') return '';
   const kind = String((evt as any)?.kind || (evt as any)?.message?.kind || '').trim().toLowerCase();
@@ -257,6 +294,8 @@ function listingRepostKey(evt: any): string {
   if (!tradeId) return '';
   const channel = String((evt as any)?.channel || '').trim().toLowerCase();
   const signer = String((evt as any)?.message?.signer || (evt as any)?.from || '').trim().toLowerCase();
+  const bodyFp = listingBodyFingerprint(evt);
+  if (bodyFp) return `${kind}|${channel}|${tradeId}|${signer}|${bodyFp}`;
   return `${kind}|${channel}|${tradeId}|${signer}`;
 }
 
@@ -1603,6 +1642,75 @@ function App() {
       throw new Error(String((cj as any).error || 'quote_post_from_rfq failed'));
     }
     return cj && typeof cj === 'object' ? cj : null;
+  }
+
+  function listingChannelsForCancel(evt: any): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const add = (raw: any) => {
+      const ch = String(raw || '').trim();
+      if (!ch) return;
+      if (isSwapTradeChannelName(ch)) return;
+      if (seen.has(ch)) return;
+      seen.add(ch);
+      out.push(ch);
+    };
+    const chans = Array.isArray((evt as any)?.channels) ? (evt as any).channels : [];
+    for (const c of chans) add(c);
+    add((evt as any)?.channel);
+    return out;
+  }
+
+  async function cancelListingFromEvent(evt: any, opts: { kindLabel: 'Offer' | 'RFQ' }) {
+    const kindLabel = String(opts?.kindLabel || 'Listing');
+    const tradeId = String((evt as any)?.trade_id || (evt as any)?.message?.trade_id || '').trim();
+    if (!tradeId) throw new Error(`${kindLabel} cancel: missing trade_id`);
+
+    const body = (evt as any)?.message?.body && typeof (evt as any).message.body === 'object' ? (evt as any).message.body : {};
+    const validUntilRaw = Number.parseInt(String((body as any)?.valid_until_unix ?? ''), 10);
+    const validUntil = Number.isFinite(validUntilRaw) && validUntilRaw > 0 ? validUntilRaw : null;
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (validUntil && validUntil <= nowSec) {
+      throw new Error(`${kindLabel} cancel: listing is expired`);
+    }
+
+    const channels = listingChannelsForCancel(evt);
+    if (channels.length < 1) throw new Error(`${kindLabel} cancel: missing listing channel`);
+
+    if (toolRequiresApproval('intercomswap_swap_cancel_post') && !autoApprove) {
+      const ok = window.confirm(
+        `Cancel this ${kindLabel.toLowerCase()} now?\n\ntrade_id: ${tradeId}\nchannels: ${channels.join(', ')}`
+      );
+      if (!ok) return;
+    }
+
+    let okCount = 0;
+    let firstErr = '';
+    for (const channel of channels) {
+      try {
+        const out = await runToolFinal(
+          'intercomswap_swap_cancel_post',
+          { channel, trade_id: tradeId, reason: `${kindLabel.toLowerCase()} canceled manually` },
+          { auto_approve: true }
+        );
+        const cj = out?.content_json;
+        if (cj && typeof cj === 'object' && String((cj as any).type || '') === 'error') {
+          throw new Error(String((cj as any).error || 'cancel failed'));
+        }
+        okCount += 1;
+      } catch (e: any) {
+        if (!firstErr) firstErr = e?.message || String(e);
+      }
+    }
+
+    if (okCount < 1) {
+      throw new Error(firstErr || `${kindLabel} cancel failed`);
+    }
+    pushToast('success', `${kindLabel} canceled on ${okCount}/${channels.length} channel${channels.length === 1 ? '' : 's'}.`);
+    if (okCount < channels.length) {
+      pushToast('error', `${kindLabel} cancel partial failure: ${firstErr || 'unknown error'}`);
+    }
+    void refreshPreflight();
   }
 
   function feedEventId(prefix: string, e: any, fallbackIndex?: number) {
@@ -5651,18 +5759,28 @@ function App() {
                       <span className="mono">{it.title} <span className="dim">{typeof it.count === 'number' ? it.count : ''}</span></span>
                       <span className="mono dim">{it.open ? '▾' : '▸'}</span>
                     </div>
-	                  ) : it._t === 'offer' ? (
-	                    <OfferRow
-	                      evt={it.evt}
-	                      oracle={oracle}
-	                      showRespond={false}
-	                      onSelect={() => setSelected({ type: it.badge ? 'offer_posted' : 'offer', evt: it.evt })}
-	                      onRespond={() => {}}
-	                    />
-	                  ) : (
-	                    <RfqRow
-	                      evt={it.evt}
-	                      oracle={oracle}
+		                  ) : it._t === 'offer' ? (
+		                    <OfferRow
+		                      evt={it.evt}
+		                      oracle={oracle}
+		                      showRespond={false}
+                      showCancel={Boolean(it.badge)}
+		                      onSelect={() => setSelected({ type: it.badge ? 'offer_posted' : 'offer', evt: it.evt })}
+		                      onRespond={() => {}}
+                      onCancel={() => {
+                        void (async () => {
+                          try {
+                            await cancelListingFromEvent(it.evt, { kindLabel: 'Offer' });
+                          } catch (e: any) {
+                            pushToast('error', e?.message || String(e));
+                          }
+                        })();
+                      }}
+		                    />
+		                  ) : (
+		                    <RfqRow
+		                      evt={it.evt}
+		                      oracle={oracle}
 	                      showQuote={!it.badge}
 	                      onSelect={() => setSelected({ type: it.badge ? 'rfq_posted' : 'rfq', evt: it.evt })}
 	                      onQuote={() => {
@@ -6137,17 +6255,27 @@ function App() {
                           })();
                         }}
                       />
-	                  ) : (
-	                    <RfqRow
-	                      evt={it.evt}
-	                      oracle={oracle}
-	                      showQuote={false}
-	                      onSelect={() => setSelected({ type: it.badge ? 'rfq_posted' : 'rfq', evt: it.evt })}
-	                      onQuote={() => {}}
-	                    />
-                  )
-                }
-              />
+		                  ) : (
+		                    <RfqRow
+		                      evt={it.evt}
+		                      oracle={oracle}
+		                      showQuote={false}
+                      showCancel={Boolean(it.badge)}
+		                      onSelect={() => setSelected({ type: it.badge ? 'rfq_posted' : 'rfq', evt: it.evt })}
+		                      onQuote={() => {}}
+                      onCancel={() => {
+                        void (async () => {
+                          try {
+                            await cancelListingFromEvent(it.evt, { kindLabel: 'RFQ' });
+                          } catch (e: any) {
+                            pushToast('error', e?.message || String(e));
+                          }
+                        })();
+                      }}
+		                    />
+		                  )
+	                }
+	              />
             </Panel>
           </div>
         ) : null}
@@ -9357,13 +9485,17 @@ function RfqRow({
   oracle,
   onSelect,
   onQuote,
+  onCancel = null,
   showQuote = true,
+  showCancel = false,
 }: {
   evt: any;
   oracle?: OracleSummary;
   onSelect: () => void;
   onQuote: () => void;
+  onCancel?: (() => void) | null;
   showQuote?: boolean;
+  showCancel?: boolean;
 }) {
   const body = evt?.message?.body;
   const btcSats = typeof body?.btc_sats === 'number' ? body.btc_sats : null;
@@ -9387,6 +9519,8 @@ function RfqRow({
         : '?';
   const pricePerBtc = btcBtc !== null && btcBtc > 0 && usdtNum !== null ? usdtNum / btcBtc : null;
   const priceDisplay = pricePerBtc !== null ? formatHumanNumber(pricePerBtc, { maxFractionDigits: 2 }) : '?';
+  const canQuote = Boolean(showQuote && !expired);
+  const canCancel = Boolean(showCancel && !expired && typeof onCancel === 'function');
   return (
     <div className={`rowitem ${expired ? 'expired' : ''}`} role="button" onClick={onSelect}>
       <div className="rowitem-top">
@@ -9402,17 +9536,30 @@ function RfqRow({
         <span className="muted">win {typeof minWin === 'number' ? secToHuman(minWin) : '?'}–{typeof maxWin === 'number' ? secToHuman(maxWin) : '?'}</span>
         <span className="dim">{validUntilIso ? `exp ${validUntilIso}` : ''}</span>
       </div>
-      {showQuote && !expired ? (
+      {canQuote || canCancel ? (
         <div className="rowitem-bot">
-          <button
-            className="btn small primary"
-            onClick={(e) => {
-              e.stopPropagation();
-              onQuote();
-            }}
-          >
-            Quote
-          </button>
+          {canQuote ? (
+            <button
+              className="btn small primary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onQuote();
+              }}
+            >
+              Quote
+            </button>
+          ) : null}
+          {canCancel ? (
+            <button
+              className="btn small danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancel?.();
+              }}
+            >
+              Cancel
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -9424,13 +9571,17 @@ function OfferRow({
   oracle,
   onSelect,
   onRespond,
+  onCancel = null,
   showRespond = true,
+  showCancel = false,
 }: {
   evt: any;
   oracle?: OracleSummary;
   onSelect: () => void;
   onRespond: () => void;
+  onCancel?: (() => void) | null;
   showRespond?: boolean;
+  showCancel?: boolean;
 }) {
   const body = evt?.message?.body;
   const offers = Array.isArray(body?.offers) ? body.offers : [];
@@ -9457,6 +9608,8 @@ function OfferRow({
         : '?';
   const pricePerBtc = btcBtc !== null && btcBtc > 0 && usdtNum !== null ? usdtNum / btcBtc : null;
   const priceDisplay = pricePerBtc !== null ? formatHumanNumber(pricePerBtc, { maxFractionDigits: 2 }) : '?';
+  const canRespond = Boolean(showRespond && !expired);
+  const canCancel = Boolean(showCancel && !expired && typeof onCancel === 'function');
 
   return (
     <div className={`rowitem ${expired ? 'expired' : ''}`} role="button" onClick={onSelect}>
@@ -9474,17 +9627,30 @@ function OfferRow({
         <span className="muted">win {typeof minWin === 'number' ? secToHuman(minWin) : '?'}–{typeof maxWin === 'number' ? secToHuman(maxWin) : '?'}</span>
         <span className="dim">{validUntilIso ? `exp ${validUntilIso}` : ''}</span>
       </div>
-      {showRespond && !expired ? (
+      {canRespond || canCancel ? (
         <div className="rowitem-bot">
-          <button
-            className="btn small primary"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRespond();
-            }}
-          >
-            Respond
-          </button>
+          {canRespond ? (
+            <button
+              className="btn small primary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRespond();
+              }}
+            >
+              Respond
+            </button>
+          ) : null}
+          {canCancel ? (
+            <button
+              className="btn small danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancel?.();
+              }}
+            >
+              Cancel
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>
