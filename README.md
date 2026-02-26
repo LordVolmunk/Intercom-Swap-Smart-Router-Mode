@@ -1,3 +1,22 @@
+# IntercomSwap Smart Router API
+
+TRAC Address:
+trac1qr2mkd06fdshhzpncvg0q8euaq3tthpv9f4u5vt7nygrgxhsv04qe3htpz
+
+## Description
+
+This fork upgrades IntercomSwap with:
+
+- Smart route selection
+- Automatic best liquidity detection
+- REST API mode
+- Ready for deployment
+
+## Example
+
+GET:
+http://localhost:3000/route?from=ETH&to=USDT
+
 # Intercom Swap
 
 This repo is a fork of upstream **Intercom** (Trac-Systems/intercom): a reference implementation of the Intercom stack on Trac Network for an internet of agents.

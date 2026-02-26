@@ -4,8 +4,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/*.test.js",
-    "test:e2e": "node --test --test-concurrency=1 test-e2e/*.test.js"
+    "name": "intercom-swap-smart-router-mode",
+    "version": "1.0.0",
+    "type": "module"
   },
   "pear": {
     "name": "contract-test-latest",
@@ -14,11 +15,14 @@
   "dependencies": {
     "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.98.4",
+    "axios": "^1.13.5",
     "b4a": "^1.6.7",
     "bare-ws": "2.0.3",
     "bech32": "^2.0.0",
     "compact-encoding": "^2.18.0",
+    "cors": "^2.8.6",
     "crypto": "npm:bare-node-crypto",
+    "express": "^5.2.1",
     "fs": "npm:bare-node-fs",
     "path": "npm:bare-node-path",
     "protomux": "^3.10.1",
@@ -29,5 +33,12 @@
   },
   "overrides": {
     "trac-wallet": "1.0.1"
-  }
+  },
+  "description": "This repo is a fork of upstream **Intercom** (Trac-Systems/intercom): a reference implementation of the Intercom stack on Trac Network for an internet of agents.",
+  "directories": {
+    "test": "test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
 }

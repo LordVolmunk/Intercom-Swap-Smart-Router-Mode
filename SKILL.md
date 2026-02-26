@@ -1,3 +1,27 @@
+# IntercomSwap Smart Router Skill
+
+This skill enables smart route detection between tokens.
+
+## How to use
+
+Request:
+
+/route?from=TOKENA&to=TOKENB
+
+Example:
+
+/route?from=ETH&to=USDT
+
+The API will return:
+
+- Best DEX
+- Price
+- Liquidity
+- 24h Volume
+- Best route selection logic
+
+This fork improves route discovery by selecting the highest liquidity pair automatically.
+
 ---
 name: intercomswap
 description: "Install and operate Intercom Swap: a fork of Intercom that negotiates P2P RFQ swaps over sidechannels and settles BTC over Lightning to USDT on Solana via a shared escrow program, with deterministic operator tooling, recovery, and unattended end-to-end tests."
