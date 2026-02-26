@@ -12,7 +12,9 @@ This fork upgrades IntercomSwap with:
 - REST API mode
 - Ready for deployment
 
-## Example
+## Proof ![proofwork](image.png)
+
+## Example 
 
 GET:
 http://localhost:3000/route?from=ETH&to=USDT
